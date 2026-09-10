@@ -4,9 +4,21 @@ const router = express.Router();
 
 const authMiddleware = require("../middleware/authMiddleware");
 
-const { getMessages } = require("../controllers/messageController");
+const {
+  getMessages,
+  getMessageCount,
+} = require("../controllers/messageController");
 
-// Get messages of a chat
+// =====================================================
+// GET TOTAL MESSAGE COUNT
+// =====================================================
+
+router.get("/count", authMiddleware, getMessageCount);
+
+// =====================================================
+// GET MESSAGES OF A CHAT
+// =====================================================
+
 router.get("/:chatId", authMiddleware, getMessages);
 
 module.exports = router;

@@ -324,6 +324,52 @@ const deleteFile = async (req, res) => {
   }
 };
 
+const getFileStats = async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const files = await File.find({
+      userId,
+    })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const filesUploaded = files.length;
+
+    const totalBytes = files.reduce(
+      (total, file) => total + (Number(file.size) || 0),
+      0,
+    );
+
+    const recentUploads = files.slice(0, 5).map((file) => ({
+      ...file,
+      type: fileTypeFromName(file.originalName),
+      sizeLabel: fileSizeLabel(file.size),
+      createdDate: new Date(file.createdAt).toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+      }),
+    }));
+
+    return res.status(200).json({
+      success: true,
+      stats: {
+        filesUploaded,
+        totalBytes,
+        recentUploads,
+      },
+    });
+  } catch (error) {
+    console.error("Get file stats error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
 module.exports = {
   createFolder,
   listFolders,
@@ -332,4 +378,5 @@ module.exports = {
   createFile,
   downloadFile,
   deleteFile,
+  getFileStats,
 };
