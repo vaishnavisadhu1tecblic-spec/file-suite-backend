@@ -1,4 +1,9 @@
 const Message = require("../models/Message");
+const Conversation = require("../models/Conversation");
+const {
+  getConversationForMember,
+  isValidConversationId,
+} = require("../utils/conversationAccess");
 
 // =====================================================
 // CREATE PRIVATE CHAT ID
@@ -18,20 +23,78 @@ const getMessages = async (req, res) => {
 
     const currentUserId = String(req.user.id);
 
-    const messages = await Message.find({
-      chatId: String(chatId),
+    if (isValidConversationId(chatId)) {
+      const conversation = await getConversationForMember(
+        chatId,
+        currentUserId,
+      );
 
-      $or: [
-        {
-          senderId: currentUserId,
-        },
-        {
-          receiverId: currentUserId,
-        },
-        {
-          receiverId: null,
-        },
-      ],
+      if (!conversation) {
+        return res.status(403).json({
+          success: false,
+          message: "You are not a conversation member",
+        });
+      }
+
+      const conversationMessages = await Message.find({
+        conversationId: chatId,
+      })
+        .sort({ createdAt: 1 })
+        .lean();
+
+      return res.status(200).json({
+        success: true,
+        messages: conversationMessages,
+      });
+    }
+
+    const legacyConversation = await Conversation.findOne({
+      type: "group",
+      legacyChatId: String(chatId),
+    });
+
+    if (legacyConversation) {
+      const isMember = legacyConversation.members.some(
+        (member) => String(member.userId) === currentUserId,
+      );
+
+      if (!isMember) {
+        return res.status(403).json({
+          success: false,
+          message: "You are not a conversation member",
+        });
+      }
+
+      const legacyMessages = await Message.find({
+        $or: [
+          { conversationId: legacyConversation._id },
+          { chatId: String(chatId), receiverId: null },
+        ],
+      })
+        .sort({ createdAt: 1 })
+        .lean();
+
+      return res.status(200).json({
+        success: true,
+        messages: legacyMessages,
+      });
+    }
+
+    const privateConversation = await Conversation.findOne({
+      type: "private",
+      privateKey: String(chatId).split("_").sort().join(":"),
+      "members.userId": currentUserId,
+    });
+
+    if (!privateConversation) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not a conversation member",
+      });
+    }
+
+    const messages = await Message.find({
+      conversationId: privateConversation._id,
     })
       .sort({ createdAt: 1 })
       .lean();

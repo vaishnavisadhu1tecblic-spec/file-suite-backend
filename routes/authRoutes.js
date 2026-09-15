@@ -9,6 +9,9 @@ const {
   updateUser,
   deleteUser,
   googleLogin,
+  forgotPassword,
+  resetPassword,
+  validateResetToken,
 } = require("../controllers/authController");
 
 const upload = require("../middleware/uploadMiddleware");
@@ -21,6 +24,10 @@ router.post("/register", upload.single("image"), register);
 router.post("/login", login);
 
 router.post("/google", googleLogin);
+
+router.post("/forgot-password", forgotPassword);
+router.get("/reset-password/:token", validateResetToken);
+router.post("/reset-password", resetPassword);
 
 // Get All Users
 router.get("/users", authMiddleware, getUsers);

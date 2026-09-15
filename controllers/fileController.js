@@ -70,10 +70,27 @@ const createFolder = async (req, res) => {
       });
     }
 
+    let parentFolderId = null;
+
+    if (parentFolder) {
+      const ownedParentFolder = await Folder.findOne({
+        _id: parentFolder,
+        userId: req.user.id,
+      });
+
+      if (!ownedParentFolder) {
+        return res.status(404).json({
+          message: "Parent folder not found",
+        });
+      }
+
+      parentFolderId = ownedParentFolder._id;
+    }
+
     const existingFolder = await Folder.findOne({
       name: name.trim(),
       userId: req.user.id,
-      parentFolder: parentFolder || null,
+      parentFolder: parentFolderId,
     });
 
     if (existingFolder) {
@@ -85,7 +102,7 @@ const createFolder = async (req, res) => {
     const folder = await Folder.create({
       name: name.trim(),
       userId: req.user.id,
-      parentFolder: parentFolder || null,
+      parentFolder: parentFolderId,
     });
 
     return res.status(201).json({

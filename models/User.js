@@ -27,6 +27,18 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: false, // Google login ke liye
     },
+
+    passwordResetTokenHash: {
+      type: String,
+      default: null,
+      select: false,
+    },
+
+    passwordResetExpiresAt: {
+      type: Date,
+      default: null,
+      select: false,
+    },
   },
   {
     timestamps: true,

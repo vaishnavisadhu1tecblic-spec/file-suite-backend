@@ -11,8 +11,17 @@ const connectDB = require("./config/db");
 const authRoutes = require("./routes/authRoutes");
 const messageRoutes = require("./routes/messageRoutes");
 const fileRoutes = require("./routes/fileRoutes");
+const conversationRoutes = require("./routes/conversationRoutes");
 
 const Message = require("./models/Message");
+const Conversation = require("./models/Conversation");
+const User = require("./models/User");
+const {
+  getConversationForMember,
+  getOrCreateLegacyConversation,
+  getOrCreatePrivateConversation,
+  isValidConversationId,
+} = require("./utils/conversationAccess");
 
 const app = express();
 
@@ -42,8 +51,6 @@ app.use(express.json());
 // STATIC
 // =====================================================
 
-app.use("/uploads", express.static("uploads"));
-
 // =====================================================
 // ROUTES
 // =====================================================
@@ -51,6 +58,7 @@ app.use("/uploads", express.static("uploads"));
 app.use("/api/auth", authRoutes);
 app.use("/api/messages", messageRoutes);
 app.use("/api/files", fileRoutes);
+app.use("/api/conversations", conversationRoutes);
 
 // =====================================================
 // HOME
@@ -77,6 +85,8 @@ const io = new Server(server, {
     credentials: true,
   },
 });
+
+app.set("io", io);
 
 // =====================================================
 // SOCKET AUTHENTICATION
@@ -149,7 +159,7 @@ io.on("connection", (socket) => {
   // JOIN PRIVATE CHAT
   // ===================================================
 
-  socket.on("join_private_chat", (receiverId) => {
+  socket.on("join_private_chat", async (receiverId) => {
     try {
       if (!receiverId) {
         console.log("Receiver ID missing while joining private chat");
@@ -157,9 +167,22 @@ io.on("connection", (socket) => {
         return;
       }
 
+      const receiver = await User.findById(receiverId).select("_id");
+
+      if (!receiver) {
+        console.log("Private chat receiver not found");
+        return;
+      }
+
+      const conversation = await getOrCreatePrivateConversation(
+        socket.userId,
+        receiver._id,
+      );
+
       const roomName = getPrivateRoom(socket.userId, receiverId);
 
       socket.join(roomName);
+      socket.join(`conversation_${conversation._id}`);
 
       console.log("=================================");
       console.log("PRIVATE ROOM JOINED");
@@ -176,20 +199,55 @@ io.on("connection", (socket) => {
   // JOIN GROUP CHAT
   // ===================================================
 
-  socket.on("join_chat", (chatId) => {
+  socket.on("join_chat", async (chatId, acknowledge) => {
     try {
       if (!chatId) {
         console.log("Group chat ID missing");
+        acknowledge?.({ success: false, status: 400 });
         return;
       }
 
       const roomName = `group_${String(chatId)}`;
+      let conversation;
+
+      if (isValidConversationId(chatId)) {
+        conversation = await getConversationForMember(chatId, socket.userId);
+
+        if (!conversation) {
+          console.log("Unauthorized group room join:", chatId);
+          return;
+        }
+
+        socket.join(`conversation_${conversation._id}`);
+      } else {
+        conversation = await getOrCreateLegacyConversation(
+          chatId,
+          socket.userId,
+        );
+
+        if (
+          !conversation?.members?.some(
+            (member) => String(member.userId) === String(socket.userId),
+          )
+        ) {
+          console.log("Unauthorized legacy group room join:", chatId);
+          acknowledge?.({ success: false, status: 403 });
+          return;
+        }
+
+        socket.join(`conversation_${conversation._id}`);
+      }
 
       socket.join(roomName);
+      acknowledge?.({
+        success: true,
+        conversationId: String(conversation._id),
+      });
 
       console.log(`User ${socket.userId} joined group ${roomName}`);
     } catch (error) {
       console.error("Join group chat error:", error);
+      acknowledge?.({ success: false, status: 500 });
     }
   });
 
@@ -228,6 +286,19 @@ io.on("connection", (socket) => {
       // -------------------------------------------------
 
       const chatId = getPrivateRoom(senderId, receiverId);
+      const receiver = await User.findById(receiverId).select("_id");
+
+      if (!receiver) {
+        console.log("Private message receiver not found");
+        return;
+      }
+
+      const conversation = await getOrCreatePrivateConversation(
+        senderId,
+        receiverId,
+      );
+
+      socket.join(`conversation_${conversation._id}`);
 
       // -------------------------------------------------
       // TIME
@@ -246,6 +317,7 @@ io.on("connection", (socket) => {
 
       const savedMessage = await Message.create({
         chatId,
+        conversationId: conversation._id,
         senderId,
         receiverId,
         text: message.text.trim(),
@@ -343,6 +415,27 @@ io.on("connection", (socket) => {
       }
 
       const chatId = String(message.chatId);
+      let conversation = null;
+
+      if (isValidConversationId(chatId)) {
+        conversation = await getConversationForMember(chatId, socket.userId);
+
+        if (!conversation) {
+          console.log("Unauthorized group message:", chatId);
+          return;
+        }
+      } else {
+        conversation = await Conversation.findOne({
+          type: "group",
+          legacyChatId: chatId,
+          "members.userId": socket.userId,
+        });
+
+        if (!conversation) {
+          console.log("Unauthorized legacy group message:", chatId);
+          return;
+        }
+      }
 
       const time =
         message.time ||
@@ -357,6 +450,7 @@ io.on("connection", (socket) => {
 
       const savedMessage = await Message.create({
         chatId,
+        conversationId: conversation?._id || null,
         senderId: String(socket.userId),
         receiverId: null,
         text: message.text.trim(),

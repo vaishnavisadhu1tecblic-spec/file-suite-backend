@@ -8,6 +8,13 @@ const messageSchema = new mongoose.Schema(
       index: true,
     },
 
+    conversationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Conversation",
+      default: null,
+      index: true,
+    },
+
     senderId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
@@ -25,6 +32,30 @@ const messageSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
+    },
+
+    messageType: {
+      type: String,
+      enum: ["text", "file"],
+      default: "text",
+    },
+
+    fileId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "File",
+      default: null,
+    },
+
+    attachment: {
+      name: { type: String, default: "" },
+      type: { type: String, default: "" },
+      mimeType: { type: String, default: "" },
+      size: { type: Number, default: 0 },
+      permission: {
+        type: String,
+        enum: ["view", "download"],
+        default: "download",
+      },
     },
 
     time: {
