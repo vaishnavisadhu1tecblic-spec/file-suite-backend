@@ -54,7 +54,6 @@ const sendPasswordResetEmail = async (email, resetUrl) => {
 
   if (!mailer) {
     console.warn("Password reset email service is not configured.");
-    console.warn(`Development reset URL for ${email}: ${resetUrl}`);
     return;
   }
 
@@ -249,6 +248,13 @@ const forgotPassword = async (req, res) => {
         await sendPasswordResetEmail(user.email, resetUrl);
       } catch (emailError) {
         console.error("Password reset email delivery failed:", emailError);
+      }
+
+      if (process.env.NODE_ENV === "development") {
+        console.log("==================================================");
+        console.log("PASSWORD RESET LINK (DEVELOPMENT ONLY)");
+        console.log(resetUrl);
+        console.log("==================================================");
       }
     }
 

@@ -28,6 +28,13 @@ const userSchema = new mongoose.Schema(
       required: false, // Google login ke liye
     },
 
+    friends: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+      },
+    ],
+
     passwordResetTokenHash: {
       type: String,
       default: null,

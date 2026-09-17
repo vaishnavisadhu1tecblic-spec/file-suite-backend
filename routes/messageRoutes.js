@@ -7,17 +7,12 @@ const authMiddleware = require("../middleware/authMiddleware");
 const {
   getMessages,
   getMessageCount,
+  deleteMessage,
 } = require("../controllers/messageController");
-
-// =====================================================
-// GET TOTAL MESSAGE COUNT
-// =====================================================
 
 router.get("/count", authMiddleware, getMessageCount);
 
-// =====================================================
-// GET MESSAGES OF A CHAT
-// =====================================================
+router.delete("/:messageId", authMiddleware, deleteMessage);
 
 router.get("/:chatId", authMiddleware, getMessages);
 

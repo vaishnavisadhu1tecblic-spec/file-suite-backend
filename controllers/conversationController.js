@@ -12,6 +12,7 @@ const {
   getOrCreateLegacyConversation,
   getOrCreatePrivateConversation,
 } = require("../utils/conversationAccess");
+const { areFriends } = require("../utils/friendAccess");
 
 const getFileType = (name) => {
   const extension = path.extname(name || "").toLowerCase();
@@ -94,11 +95,43 @@ const ensureAdmin = (conversation, userId) => {
 
 const listConversations = async (req, res) => {
   try {
-    const conversations = await Conversation.find({
+    const query = {
       "members.userId": req.user.id,
-    })
+    };
+
+    if (req.query.type === "private") {
+      query.type = "private";
+    }
+
+    let conversations = await Conversation.find(query)
+      .populate("members.userId", "name username email")
       .sort({ updatedAt: -1 })
       .lean();
+
+    if (req.query.type === "private") {
+      conversations = (
+        await Promise.all(
+          conversations.map(async (conversation) => {
+            const otherMember = conversation.members.find(
+              (member) =>
+                String(member.userId?._id || member.userId) !==
+                String(req.user.id),
+            );
+
+            if (!otherMember) {
+              return null;
+            }
+
+            return (await areFriends(
+              req.user.id,
+              otherMember.userId?._id || otherMember.userId,
+            ))
+              ? conversation
+              : null;
+          }),
+        )
+      ).filter(Boolean);
+    }
 
     return res.status(200).json({ success: true, conversations });
   } catch (error) {
@@ -119,6 +152,12 @@ const createPrivateConversation = async (req, res) => {
       return res
         .status(400)
         .json({ message: "Cannot create a chat with yourself" });
+    }
+
+    if (!(await areFriends(req.user.id, otherUser._id))) {
+      return res.status(403).json({
+        message: "You must be friends before starting a private conversation",
+      });
     }
 
     const conversation = await getOrCreatePrivateConversation(

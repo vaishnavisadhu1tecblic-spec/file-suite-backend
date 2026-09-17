@@ -19,9 +19,10 @@ const User = require("./models/User");
 const {
   getConversationForMember,
   getOrCreateLegacyConversation,
-  getOrCreatePrivateConversation,
   isValidConversationId,
 } = require("./utils/conversationAccess");
+const { areFriends } = require("./utils/friendAccess");
+const friendRoutes = require("./routes/friendRoutes");
 
 const app = express();
 
@@ -35,7 +36,11 @@ connectDB();
 // MIDDLEWARE
 // =====================================================
 
-const allowedOrigins = ["http://localhost:5173", "http://localhost:5174"];
+const allowedOrigins = [
+  "http://localhost:5173",
+  "http://localhost:5174",
+  process.env.FRONTEND_URL,
+];
 
 app.use(
   cors({
@@ -56,6 +61,7 @@ app.use(express.json());
 // =====================================================
 
 app.use("/api/auth", authRoutes);
+app.use("/api/friends", friendRoutes);
 app.use("/api/messages", messageRoutes);
 app.use("/api/files", fileRoutes);
 app.use("/api/conversations", conversationRoutes);
@@ -174,10 +180,31 @@ io.on("connection", (socket) => {
         return;
       }
 
-      const conversation = await getOrCreatePrivateConversation(
-        socket.userId,
-        receiver._id,
-      );
+      if (!(await areFriends(socket.userId, receiverId))) {
+        console.log("Unauthorized private chat: users are not friends");
+        return;
+      }
+
+      const conversation = await Conversation.findOne({
+        type: "private",
+        privateKey: [socket.userId, receiverId].sort().join(":"),
+        members: {
+          $all: [
+            { $elemMatch: { userId: socket.userId } },
+            { $elemMatch: { userId: receiverId } },
+          ],
+        },
+      });
+
+      if (
+        !conversation ||
+        !conversation.members.some(
+          (member) => String(member.userId) === receiverId,
+        )
+      ) {
+        console.log("Unauthorized private chat room join");
+        return;
+      }
 
       const roomName = getPrivateRoom(socket.userId, receiverId);
 
@@ -255,8 +282,12 @@ io.on("connection", (socket) => {
   // SEND PRIVATE MESSAGE
   // ===================================================
 
-  socket.on("send_private_message", async (message) => {
+  socket.on("send_private_message", async (message, acknowledge) => {
     try {
+      console.log("CHAT DEBUG authenticated socket user ID:", socket.userId);
+      console.log("CHAT DEBUG received senderId:", message?.senderId);
+      console.log("CHAT DEBUG receiverId:", message?.receiverId);
+      console.log("CHAT DEBUG received chatId:", message?.chatId);
       console.log("=================================");
       console.log("PRIVATE MESSAGE RECEIVED");
       console.log("FROM:", socket.userId);
@@ -269,12 +300,16 @@ io.on("connection", (socket) => {
       // -------------------------------------------------
 
       if (!message?.receiverId) {
-        console.log("Receiver ID missing");
+        const rejection = { success: false, reason: "Receiver ID missing" };
+        console.log("CHAT DEBUG rejection:", rejection);
+        acknowledge?.(rejection);
         return;
       }
 
       if (!message?.text?.trim()) {
-        console.log("Message text missing");
+        const rejection = { success: false, reason: "Message text missing" };
+        console.log("CHAT DEBUG rejection:", rejection);
+        acknowledge?.(rejection);
         return;
       }
 
@@ -289,13 +324,64 @@ io.on("connection", (socket) => {
       const receiver = await User.findById(receiverId).select("_id");
 
       if (!receiver) {
-        console.log("Private message receiver not found");
+        const rejection = {
+          success: false,
+          reason: "Private message receiver not found",
+        };
+        console.log("CHAT DEBUG rejection:", rejection);
+        acknowledge?.(rejection);
         return;
       }
 
-      const conversation = await getOrCreatePrivateConversation(
-        senderId,
-        receiverId,
+      const friendshipResult = await areFriends(senderId, receiverId);
+      console.log("CHAT DEBUG friendship check result:", friendshipResult);
+
+      if (!friendshipResult) {
+        const rejection = {
+          success: false,
+          reason: "Users are not accepted friends",
+        };
+        console.log("CHAT DEBUG rejection:", rejection);
+        acknowledge?.(rejection);
+        return;
+      }
+
+      const conversation = await Conversation.findOne({
+        type: "private",
+        privateKey: [senderId, receiverId].sort().join(":"),
+        members: {
+          $all: [
+            { $elemMatch: { userId: senderId } },
+            { $elemMatch: { userId: receiverId } },
+          ],
+        },
+      });
+
+      console.log("CHAT DEBUG private conversation lookup result:", {
+        found: Boolean(conversation),
+        conversationId: conversation ? String(conversation._id) : null,
+      });
+
+      if (
+        !conversation ||
+        conversation.type !== "private" ||
+        !conversation.members.some(
+          (member) => String(member.userId) === receiverId,
+        )
+      ) {
+        const rejection = {
+          success: false,
+          reason: "Private conversation not found or membership invalid",
+          chatId,
+        };
+        console.log("CHAT DEBUG rejection:", rejection);
+        acknowledge?.(rejection);
+        return;
+      }
+
+      console.log(
+        "CHAT DEBUG resolved conversationId:",
+        String(conversation._id),
       );
 
       socket.join(`conversation_${conversation._id}`);
@@ -322,6 +408,17 @@ io.on("connection", (socket) => {
         receiverId,
         text: message.text.trim(),
         time,
+      });
+
+      console.log("CHAT DEBUG message save result:", {
+        success: true,
+        messageId: String(savedMessage._id),
+        conversationId: String(savedMessage.conversationId),
+      });
+      acknowledge?.({
+        success: true,
+        messageId: String(savedMessage._id),
+        conversationId: String(savedMessage.conversationId),
       });
 
       console.log("=================================");
@@ -387,6 +484,11 @@ io.on("connection", (socket) => {
       console.log("TYPE:", receiverMessage.type);
       console.log("=================================");
     } catch (error) {
+      console.error("CHAT DEBUG private message exception:", error);
+      acknowledge?.({
+        success: false,
+        reason: "Private message processing failed",
+      });
       console.error("PRIVATE MESSAGE SAVE ERROR:", error);
     }
   });
@@ -505,6 +607,6 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 3005;
 
-server.listen(PORT, () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
 });

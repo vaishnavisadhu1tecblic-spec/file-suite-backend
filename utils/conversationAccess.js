@@ -1,5 +1,6 @@
 const mongoose = require("mongoose");
 const Conversation = require("../models/Conversation");
+const { areFriends } = require("./friendAccess");
 
 const isValidConversationId = (conversationId) =>
   mongoose.Types.ObjectId.isValid(String(conversationId));
@@ -18,6 +19,20 @@ const getConversationForMember = async (conversationId, userId) => {
     _id: conversationId,
     "members.userId": userId,
   });
+
+  if (!conversation) {
+    return null;
+  }
+
+  if (conversation.type === "private") {
+    const otherMember = conversation.members.find(
+      (member) => String(member.userId) !== String(userId),
+    );
+
+    if (!otherMember || !(await areFriends(userId, otherMember.userId))) {
+      return null;
+    }
+  }
 
   return conversation;
 };

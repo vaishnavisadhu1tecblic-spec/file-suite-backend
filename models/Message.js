@@ -62,6 +62,14 @@ const messageSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+
+    // Users who have deleted/hidden this message for themselves.
+    hiddenFor: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+      },
+    ],
   },
   {
     timestamps: true,
