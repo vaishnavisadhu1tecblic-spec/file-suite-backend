@@ -3,6 +3,8 @@ const path = require("path");
 
 const File = require("../models/File");
 const Folder = require("../models/Folder");
+const FileShare = require("../models/FileShare");
+const Conversation = require("../models/Conversation");
 
 const fileSizeLabel = (sizeInBytes) => {
   if (!sizeInBytes && sizeInBytes !== 0) {
@@ -286,16 +288,69 @@ const createFile = async (req, res) => {
 
 const downloadFile = async (req, res) => {
   try {
-    const file = await File.findOne({
-      _id: req.params.id,
-      userId: req.user.id,
-    });
+    const userId = String(req.user.id);
+    const fileId = req.params.id;
+
+    const file = await File.findById(fileId);
 
     if (!file) {
       return res.status(404).json({
         message: "File not found",
       });
     }
+
+    // =================================================
+    // OWNER ACCESS
+    // =================================================
+
+    const isOwner = String(file.userId) === userId;
+
+    if (isOwner) {
+      if (!fs.existsSync(file.path)) {
+        return res.status(404).json({
+          message: "Uploaded file missing on disk",
+        });
+      }
+
+      return res.download(file.path, file.originalName);
+    }
+
+    // =================================================
+    // SHARED FILE ACCESS
+    // =================================================
+
+    const conversations = await Conversation.find({
+      "members.userId": userId,
+    })
+      .select("_id")
+      .lean();
+
+    const conversationIds = conversations.map(
+      (conversation) => conversation._id,
+    );
+
+    if (!conversationIds.length) {
+      return res.status(403).json({
+        message: "You do not have access to this file",
+      });
+    }
+
+    const sharedFile = await FileShare.findOne({
+      fileId: file._id,
+      conversationId: { $in: conversationIds },
+      revokedAt: null,
+      permission: "download",
+    });
+
+    if (!sharedFile) {
+      return res.status(403).json({
+        message: "You do not have permission to download this file",
+      });
+    }
+
+    // =================================================
+    // FILE EXISTS ON DISK
+    // =================================================
 
     if (!fs.existsSync(file.path)) {
       return res.status(404).json({
@@ -305,6 +360,8 @@ const downloadFile = async (req, res) => {
 
     return res.download(file.path, file.originalName);
   } catch (error) {
+    console.error("Download file error:", error);
+
     return res.status(500).json({
       message: error.message,
     });
@@ -387,6 +444,67 @@ const getFileStats = async (req, res) => {
   }
 };
 
+const getSharedFiles = async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Find conversations where the logged-in user is a member
+    const conversations = await Conversation.find({
+      "members.userId": userId,
+    })
+      .select("_id")
+      .lean();
+
+    const conversationIds = conversations.map(
+      (conversation) => conversation._id,
+    );
+
+    if (!conversationIds.length) {
+      return res.status(200).json({
+        success: true,
+        files: [],
+      });
+    }
+
+    const shares = await FileShare.find({
+      conversationId: { $in: conversationIds },
+      revokedAt: null,
+    })
+      .populate("fileId")
+      .populate("sharedBy", "name username email")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const files = shares
+      .filter((share) => share.fileId)
+      .map((share) => ({
+        _id: share.fileId._id,
+        originalName: share.fileId.originalName,
+        mimeType: share.fileId.mimeType,
+        extension: share.fileId.extension,
+        size: share.fileId.size,
+        sizeLabel: fileSizeLabel(share.fileId.size),
+        type: fileTypeFromName(share.fileId.originalName),
+        createdAt: share.fileId.createdAt,
+        sharedAt: share.createdAt,
+        permission: share.permission,
+        sharedBy: share.sharedBy,
+        conversationId: share.conversationId,
+      }));
+
+    return res.status(200).json({
+      success: true,
+      files,
+    });
+  } catch (error) {
+    console.error("Get shared files error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
 module.exports = {
   createFolder,
   listFolders,
@@ -396,4 +514,5 @@ module.exports = {
   downloadFile,
   deleteFile,
   getFileStats,
+  getSharedFiles,
 };

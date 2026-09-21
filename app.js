@@ -12,17 +12,22 @@ const authRoutes = require("./routes/authRoutes");
 const messageRoutes = require("./routes/messageRoutes");
 const fileRoutes = require("./routes/fileRoutes");
 const conversationRoutes = require("./routes/conversationRoutes");
+const friendRoutes = require("./routes/friendRoutes");
+const dashboardRoutes = require("./routes/dashboardRoutes");
 
 const Message = require("./models/Message");
 const Conversation = require("./models/Conversation");
 const User = require("./models/User");
+
 const {
   getConversationForMember,
   getOrCreateLegacyConversation,
   isValidConversationId,
 } = require("./utils/conversationAccess");
+
 const { areFriends } = require("./utils/friendAccess");
-const friendRoutes = require("./routes/friendRoutes");
+
+const onlineUsers = new Map();
 
 const app = express();
 
@@ -39,8 +44,9 @@ connectDB();
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:5174",
+  "http://192.168.0.102:5173",
   process.env.FRONTEND_URL,
-];
+].filter(Boolean);
 
 app.use(
   cors({
@@ -51,11 +57,7 @@ app.use(
 );
 
 app.use(express.json());
-
-// =====================================================
-// STATIC
-// =====================================================
-
+app.use("/api/dashboard", dashboardRoutes);
 // =====================================================
 // ROUTES
 // =====================================================
@@ -141,15 +143,85 @@ const getUserRoom = (userId) => {
 };
 
 // =====================================================
+// ONLINE USER HELPERS
+// =====================================================
+
+const addOnlineUser = (userId, socketId) => {
+  const key = String(userId);
+
+  if (!onlineUsers.has(key)) {
+    onlineUsers.set(key, new Set());
+  }
+
+  onlineUsers.get(key).add(socketId);
+};
+
+const removeOnlineUser = (userId, socketId) => {
+  const key = String(userId);
+
+  const sockets = onlineUsers.get(key);
+
+  if (!sockets) {
+    return false;
+  }
+
+  sockets.delete(socketId);
+
+  if (sockets.size === 0) {
+    onlineUsers.delete(key);
+    return true;
+  }
+
+  return false;
+};
+
+const isUserOnline = (userId) => {
+  return onlineUsers.has(String(userId));
+};
+
+// =====================================================
+// BROADCAST USER PRESENCE TO FRIENDS
+// =====================================================
+
+const broadcastUserPresence = async (userId, isOnline) => {
+  try {
+    const user = await User.findById(userId).select("friends");
+
+    if (!user?.friends?.length) {
+      return;
+    }
+
+    for (const friendId of user.friends) {
+      io.to(getUserRoom(friendId)).emit("user_status_changed", {
+        userId: String(userId),
+        isOnline,
+      });
+    }
+  } catch (error) {
+    console.error("Broadcast user presence error:", error);
+  }
+};
+
+// =====================================================
 // SOCKET CONNECTION
 // =====================================================
 
-io.on("connection", (socket) => {
+io.on("connection", async (socket) => {
   console.log("=================================");
   console.log("USER CONNECTED");
   console.log("SOCKET ID:", socket.id);
   console.log("MONGO USER ID:", socket.userId);
   console.log("=================================");
+
+  // ===================================================
+  // MARK USER ONLINE
+  // ===================================================
+
+  const wasAlreadyOnline = isUserOnline(socket.userId);
+
+  addOnlineUser(socket.userId, socket.id);
+
+  console.log(`User ${socket.userId} is online`);
 
   // ===================================================
   // PERSONAL USER ROOM
@@ -160,6 +232,96 @@ io.on("connection", (socket) => {
   socket.join(userRoom);
 
   console.log(`User ${socket.userId} joined personal room ${userRoom}`);
+
+  // ===================================================
+  // BROADCAST ONLINE STATUS
+  // ===================================================
+
+  if (!wasAlreadyOnline) {
+    await broadcastUserPresence(socket.userId, true);
+  }
+
+  // ===================================================
+  // DELIVER PENDING MESSAGES
+  // ===================================================
+
+  try {
+    const pendingMessages = await Message.find({
+      receiverId: socket.userId,
+      status: "sent",
+    }).select("_id senderId chatId conversationId");
+
+    if (pendingMessages.length > 0) {
+      const deliveredAt = new Date();
+
+      await Message.updateMany(
+        {
+          _id: {
+            $in: pendingMessages.map((message) => message._id),
+          },
+        },
+        {
+          $set: {
+            status: "delivered",
+            deliveredAt,
+          },
+        },
+      );
+
+      for (const message of pendingMessages) {
+        io.to(getUserRoom(message.senderId)).emit("message_status_updated", {
+          messageId: String(message._id),
+          status: "delivered",
+          deliveredAt,
+          chatId: message.chatId ? String(message.chatId) : null,
+          conversationId: message.conversationId
+            ? String(message.conversationId)
+            : null,
+        });
+      }
+
+      console.log(
+        `Delivered ${pendingMessages.length} pending message(s) to user ${socket.userId}`,
+      );
+    }
+  } catch (error) {
+    console.error("Pending message delivery error:", error);
+  }
+
+  // ===================================================
+  // REQUEST PRESENCE
+  // ===================================================
+
+  socket.on("request_presence", ({ userIds }, acknowledge) => {
+    try {
+      if (!Array.isArray(userIds)) {
+        acknowledge?.({
+          success: false,
+          message: "userIds must be an array",
+        });
+
+        return;
+      }
+
+      const statuses = {};
+
+      userIds.forEach((userId) => {
+        statuses[String(userId)] = isUserOnline(userId);
+      });
+
+      acknowledge?.({
+        success: true,
+        statuses,
+      });
+    } catch (error) {
+      console.error("Request presence error:", error);
+
+      acknowledge?.({
+        success: false,
+        message: "Failed to get presence",
+      });
+    }
+  });
 
   // ===================================================
   // JOIN PRIVATE CHAT
@@ -177,11 +339,13 @@ io.on("connection", (socket) => {
 
       if (!receiver) {
         console.log("Private chat receiver not found");
+
         return;
       }
 
       if (!(await areFriends(socket.userId, receiverId))) {
         console.log("Unauthorized private chat: users are not friends");
+
         return;
       }
 
@@ -190,8 +354,16 @@ io.on("connection", (socket) => {
         privateKey: [socket.userId, receiverId].sort().join(":"),
         members: {
           $all: [
-            { $elemMatch: { userId: socket.userId } },
-            { $elemMatch: { userId: receiverId } },
+            {
+              $elemMatch: {
+                userId: socket.userId,
+              },
+            },
+            {
+              $elemMatch: {
+                userId: receiverId,
+              },
+            },
           ],
         },
       });
@@ -199,16 +371,18 @@ io.on("connection", (socket) => {
       if (
         !conversation ||
         !conversation.members.some(
-          (member) => String(member.userId) === receiverId,
+          (member) => String(member.userId) === String(receiverId),
         )
       ) {
         console.log("Unauthorized private chat room join");
+
         return;
       }
 
       const roomName = getPrivateRoom(socket.userId, receiverId);
 
       socket.join(roomName);
+
       socket.join(`conversation_${conversation._id}`);
 
       console.log("=================================");
@@ -216,6 +390,7 @@ io.on("connection", (socket) => {
       console.log("USER:", socket.userId);
       console.log("OTHER USER:", receiverId);
       console.log("ROOM:", roomName);
+      console.log("CONVERSATION:", String(conversation._id));
       console.log("=================================");
     } catch (error) {
       console.error("Join private chat error:", error);
@@ -230,11 +405,17 @@ io.on("connection", (socket) => {
     try {
       if (!chatId) {
         console.log("Group chat ID missing");
-        acknowledge?.({ success: false, status: 400 });
+
+        acknowledge?.({
+          success: false,
+          status: 400,
+        });
+
         return;
       }
 
       const roomName = `group_${String(chatId)}`;
+
       let conversation;
 
       if (isValidConversationId(chatId)) {
@@ -242,6 +423,12 @@ io.on("connection", (socket) => {
 
         if (!conversation) {
           console.log("Unauthorized group room join:", chatId);
+
+          acknowledge?.({
+            success: false,
+            status: 403,
+          });
+
           return;
         }
 
@@ -258,7 +445,12 @@ io.on("connection", (socket) => {
           )
         ) {
           console.log("Unauthorized legacy group room join:", chatId);
-          acknowledge?.({ success: false, status: 403 });
+
+          acknowledge?.({
+            success: false,
+            status: 403,
+          });
+
           return;
         }
 
@@ -266,6 +458,7 @@ io.on("connection", (socket) => {
       }
 
       socket.join(roomName);
+
       acknowledge?.({
         success: true,
         conversationId: String(conversation._id),
@@ -274,7 +467,11 @@ io.on("connection", (socket) => {
       console.log(`User ${socket.userId} joined group ${roomName}`);
     } catch (error) {
       console.error("Join group chat error:", error);
-      acknowledge?.({ success: false, status: 500 });
+
+      acknowledge?.({
+        success: false,
+        status: 500,
+      });
     }
   });
 
@@ -285,9 +482,13 @@ io.on("connection", (socket) => {
   socket.on("send_private_message", async (message, acknowledge) => {
     try {
       console.log("CHAT DEBUG authenticated socket user ID:", socket.userId);
+
       console.log("CHAT DEBUG received senderId:", message?.senderId);
+
       console.log("CHAT DEBUG receiverId:", message?.receiverId);
+
       console.log("CHAT DEBUG received chatId:", message?.chatId);
+
       console.log("=================================");
       console.log("PRIVATE MESSAGE RECEIVED");
       console.log("FROM:", socket.userId);
@@ -300,20 +501,33 @@ io.on("connection", (socket) => {
       // -------------------------------------------------
 
       if (!message?.receiverId) {
-        const rejection = { success: false, reason: "Receiver ID missing" };
+        const rejection = {
+          success: false,
+          reason: "Receiver ID missing",
+        };
+
         console.log("CHAT DEBUG rejection:", rejection);
+
         acknowledge?.(rejection);
+
         return;
       }
 
       if (!message?.text?.trim()) {
-        const rejection = { success: false, reason: "Message text missing" };
+        const rejection = {
+          success: false,
+          reason: "Message text missing",
+        };
+
         console.log("CHAT DEBUG rejection:", rejection);
+
         acknowledge?.(rejection);
+
         return;
       }
 
       const senderId = String(socket.userId);
+
       const receiverId = String(message.receiverId);
 
       // -------------------------------------------------
@@ -321,6 +535,7 @@ io.on("connection", (socket) => {
       // -------------------------------------------------
 
       const chatId = getPrivateRoom(senderId, receiverId);
+
       const receiver = await User.findById(receiverId).select("_id");
 
       if (!receiver) {
@@ -328,12 +543,20 @@ io.on("connection", (socket) => {
           success: false,
           reason: "Private message receiver not found",
         };
+
         console.log("CHAT DEBUG rejection:", rejection);
+
         acknowledge?.(rejection);
+
         return;
       }
 
+      // -------------------------------------------------
+      // FRIENDSHIP CHECK
+      // -------------------------------------------------
+
       const friendshipResult = await areFriends(senderId, receiverId);
+
       console.log("CHAT DEBUG friendship check result:", friendshipResult);
 
       if (!friendshipResult) {
@@ -341,18 +564,33 @@ io.on("connection", (socket) => {
           success: false,
           reason: "Users are not accepted friends",
         };
+
         console.log("CHAT DEBUG rejection:", rejection);
+
         acknowledge?.(rejection);
+
         return;
       }
+
+      // -------------------------------------------------
+      // FIND PRIVATE CONVERSATION
+      // -------------------------------------------------
 
       const conversation = await Conversation.findOne({
         type: "private",
         privateKey: [senderId, receiverId].sort().join(":"),
         members: {
           $all: [
-            { $elemMatch: { userId: senderId } },
-            { $elemMatch: { userId: receiverId } },
+            {
+              $elemMatch: {
+                userId: senderId,
+              },
+            },
+            {
+              $elemMatch: {
+                userId: receiverId,
+              },
+            },
           ],
         },
       });
@@ -374,8 +612,11 @@ io.on("connection", (socket) => {
           reason: "Private conversation not found or membership invalid",
           chatId,
         };
+
         console.log("CHAT DEBUG rejection:", rejection);
+
         acknowledge?.(rejection);
+
         return;
       }
 
@@ -387,7 +628,7 @@ io.on("connection", (socket) => {
       socket.join(`conversation_${conversation._id}`);
 
       // -------------------------------------------------
-      // TIME
+      // MESSAGE TIME
       // -------------------------------------------------
 
       const time =
@@ -396,6 +637,16 @@ io.on("connection", (socket) => {
           hour: "2-digit",
           minute: "2-digit",
         });
+
+      // -------------------------------------------------
+      // DELIVERY STATUS
+      // -------------------------------------------------
+
+      const receiverOnline = isUserOnline(receiverId);
+
+      const initialStatus = receiverOnline ? "delivered" : "sent";
+
+      const deliveredAt = receiverOnline ? new Date() : null;
 
       // -------------------------------------------------
       // SAVE MESSAGE
@@ -408,17 +659,24 @@ io.on("connection", (socket) => {
         receiverId,
         text: message.text.trim(),
         time,
+
+        status: initialStatus,
+
+        deliveredAt,
       });
 
       console.log("CHAT DEBUG message save result:", {
         success: true,
         messageId: String(savedMessage._id),
         conversationId: String(savedMessage.conversationId),
+        status: savedMessage.status,
       });
+
       acknowledge?.({
         success: true,
         messageId: String(savedMessage._id),
         conversationId: String(savedMessage.conversationId),
+        status: savedMessage.status,
       });
 
       console.log("=================================");
@@ -427,6 +685,7 @@ io.on("connection", (socket) => {
       console.log("CHAT ID:", savedMessage.chatId);
       console.log("SENDER:", savedMessage.senderId);
       console.log("RECEIVER:", savedMessage.receiverId);
+      console.log("STATUS:", savedMessage.status);
       console.log("=================================");
 
       // -------------------------------------------------
@@ -435,18 +694,32 @@ io.on("connection", (socket) => {
 
       const baseMessage = {
         _id: String(savedMessage._id),
+
         chatId: String(savedMessage.chatId),
+
+        conversationId: savedMessage.conversationId
+          ? String(savedMessage.conversationId)
+          : null,
+
         senderId: String(savedMessage.senderId),
+
         receiverId: String(savedMessage.receiverId),
+
         text: savedMessage.text,
+
         time: savedMessage.time,
+
         createdAt: savedMessage.createdAt,
+
+        status: savedMessage.status,
+
+        deliveredAt: savedMessage.deliveredAt,
+
+        readAt: savedMessage.readAt,
       };
 
       // =================================================
       // SEND TO SENDER
-      //
-      // Explicitly marked as SENT
       // =================================================
 
       const senderMessage = {
@@ -460,12 +733,11 @@ io.on("connection", (socket) => {
       console.log("MESSAGE SENT TO SENDER");
       console.log("USER:", senderId);
       console.log("TYPE:", senderMessage.type);
+      console.log("STATUS:", senderMessage.status);
       console.log("=================================");
 
       // =================================================
       // SEND TO RECEIVER
-      //
-      // Explicitly marked as RECEIVED
       // =================================================
 
       const receiverMessage = {
@@ -482,14 +754,193 @@ io.on("connection", (socket) => {
       console.log("USER:", receiverId);
       console.log("ROOM:", receiverRoom);
       console.log("TYPE:", receiverMessage.type);
+      console.log("STATUS:", receiverMessage.status);
       console.log("=================================");
     } catch (error) {
       console.error("CHAT DEBUG private message exception:", error);
+
       acknowledge?.({
         success: false,
         reason: "Private message processing failed",
       });
+
       console.error("PRIVATE MESSAGE SAVE ERROR:", error);
+    }
+  });
+
+  // ===================================================
+  // MARK PRIVATE MESSAGES AS READ
+  // ===================================================
+
+  socket.on("mark_messages_read", async ({ conversationId }, acknowledge) => {
+    try {
+      if (!conversationId) {
+        acknowledge?.({
+          success: false,
+          message: "conversationId is required",
+        });
+
+        return;
+      }
+
+      const conversation = await getConversationForMember(
+        conversationId,
+        socket.userId,
+      );
+
+      if (!conversation) {
+        acknowledge?.({
+          success: false,
+          message: "You are not a conversation member",
+        });
+
+        return;
+      }
+
+      const unreadMessages = await Message.find({
+        conversationId,
+        receiverId: socket.userId,
+        status: {
+          $ne: "read",
+        },
+      }).select("_id senderId chatId conversationId");
+
+      if (unreadMessages.length === 0) {
+        acknowledge?.({
+          success: true,
+          updatedCount: 0,
+        });
+
+        return;
+      }
+
+      const readAt = new Date();
+
+      await Message.updateMany(
+        {
+          _id: {
+            $in: unreadMessages.map((message) => message._id),
+          },
+
+          receiverId: socket.userId,
+
+          status: {
+            $ne: "read",
+          },
+        },
+        {
+          $set: {
+            status: "read",
+            readAt,
+          },
+        },
+      );
+
+      for (const message of unreadMessages) {
+        io.to(getUserRoom(message.senderId)).emit("message_status_updated", {
+          messageId: String(message._id),
+
+          status: "read",
+
+          readAt,
+
+          chatId: message.chatId ? String(message.chatId) : null,
+
+          conversationId: message.conversationId
+            ? String(message.conversationId)
+            : null,
+        });
+      }
+
+      acknowledge?.({
+        success: true,
+        updatedCount: unreadMessages.length,
+      });
+    } catch (error) {
+      console.error("Mark messages read error:", error);
+
+      acknowledge?.({
+        success: false,
+        message: "Failed to mark messages as read",
+      });
+    }
+  });
+
+  // ===================================================
+  // TYPING START
+  // ===================================================
+
+  socket.on("typing_start", async ({ receiverId, conversationId }) => {
+    try {
+      if (!receiverId || !conversationId) {
+        return;
+      }
+
+      const conversation = await getConversationForMember(
+        conversationId,
+        socket.userId,
+      );
+
+      if (!conversation) {
+        return;
+      }
+
+      const receiverIsMember = conversation.members.some(
+        (member) => String(member.userId) === String(receiverId),
+      );
+
+      if (!receiverIsMember) {
+        return;
+      }
+
+      io.to(getUserRoom(receiverId)).emit("user_typing", {
+        conversationId: String(conversationId),
+
+        userId: String(socket.userId),
+
+        isTyping: true,
+      });
+    } catch (error) {
+      console.error("Typing start error:", error);
+    }
+  });
+
+  // ===================================================
+  // TYPING STOP
+  // ===================================================
+
+  socket.on("typing_stop", async ({ receiverId, conversationId }) => {
+    try {
+      if (!receiverId || !conversationId) {
+        return;
+      }
+
+      const conversation = await getConversationForMember(
+        conversationId,
+        socket.userId,
+      );
+
+      if (!conversation) {
+        return;
+      }
+
+      const receiverIsMember = conversation.members.some(
+        (member) => String(member.userId) === String(receiverId),
+      );
+
+      if (!receiverIsMember) {
+        return;
+      }
+
+      io.to(getUserRoom(receiverId)).emit("user_typing", {
+        conversationId: String(conversationId),
+
+        userId: String(socket.userId),
+
+        isTyping: false,
+      });
+    } catch (error) {
+      console.error("Typing stop error:", error);
     }
   });
 
@@ -513,10 +964,12 @@ io.on("connection", (socket) => {
 
       if (!message?.text?.trim()) {
         console.log("Message text missing");
+
         return;
       }
 
       const chatId = String(message.chatId);
+
       let conversation = null;
 
       if (isValidConversationId(chatId)) {
@@ -524,6 +977,7 @@ io.on("connection", (socket) => {
 
         if (!conversation) {
           console.log("Unauthorized group message:", chatId);
+
           return;
         }
       } else {
@@ -535,6 +989,7 @@ io.on("connection", (socket) => {
 
         if (!conversation) {
           console.log("Unauthorized legacy group message:", chatId);
+
           return;
         }
       }
@@ -552,11 +1007,18 @@ io.on("connection", (socket) => {
 
       const savedMessage = await Message.create({
         chatId,
+
         conversationId: conversation?._id || null,
+
         senderId: String(socket.userId),
+
         receiverId: null,
+
         text: message.text.trim(),
+
         time,
+
+        status: "sent",
       });
 
       console.log("GROUP MESSAGE SAVED IN MONGODB:", savedMessage._id);
@@ -567,12 +1029,25 @@ io.on("connection", (socket) => {
 
       const messageToSend = {
         _id: String(savedMessage._id),
+
         chatId: String(savedMessage.chatId),
+
+        conversationId: savedMessage.conversationId
+          ? String(savedMessage.conversationId)
+          : null,
+
         senderId: String(savedMessage.senderId),
+
         receiverId: null,
+
         text: savedMessage.text,
+
         time: savedMessage.time,
+
         createdAt: savedMessage.createdAt,
+
+        status: savedMessage.status,
+
         type: "group",
       };
 
@@ -596,8 +1071,22 @@ io.on("connection", (socket) => {
   // DISCONNECT
   // ===================================================
 
-  socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.userId, "Socket:", socket.id);
+  socket.on("disconnect", async () => {
+    try {
+      const userWentOffline = removeOnlineUser(socket.userId, socket.id);
+
+      console.log("User disconnected:", socket.userId, "Socket:", socket.id);
+
+      // Only broadcast offline when
+      // the user has no other active sockets.
+      if (userWentOffline) {
+        console.log(`User ${socket.userId} is offline`);
+
+        await broadcastUserPresence(socket.userId, false);
+      }
+    } catch (error) {
+      console.error("Disconnect presence error:", error);
+    }
   });
 });
 

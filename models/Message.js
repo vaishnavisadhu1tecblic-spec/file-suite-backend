@@ -47,10 +47,26 @@ const messageSchema = new mongoose.Schema(
     },
 
     attachment: {
-      name: { type: String, default: "" },
-      type: { type: String, default: "" },
-      mimeType: { type: String, default: "" },
-      size: { type: Number, default: 0 },
+      name: {
+        type: String,
+        default: "",
+      },
+
+      type: {
+        type: String,
+        default: "",
+      },
+
+      mimeType: {
+        type: String,
+        default: "",
+      },
+
+      size: {
+        type: Number,
+        default: 0,
+      },
+
       permission: {
         type: String,
         enum: ["view", "download"],
@@ -63,7 +79,33 @@ const messageSchema = new mongoose.Schema(
       required: true,
     },
 
-    // Users who have deleted/hidden this message for themselves.
+    // =====================================================
+    // MESSAGE DELIVERY / READ STATUS
+    // =====================================================
+
+    status: {
+      type: String,
+      enum: ["sent", "delivered", "read"],
+      default: "sent",
+      index: true,
+    },
+
+    deliveredAt: {
+      type: Date,
+      default: null,
+    },
+
+    readAt: {
+      type: Date,
+      default: null,
+    },
+
+    // =====================================================
+    // DELETE FOR ME
+    // =====================================================
+
+    // Users who have deleted/hidden this message
+    // for themselves.
     hiddenFor: [
       {
         type: mongoose.Schema.Types.ObjectId,

@@ -5,7 +5,6 @@ const router = express.Router();
 const authMiddleware = require("../middleware/authMiddleware");
 
 const upload = require("../middleware/uploadMiddleware");
-
 const {
   createFolder,
   listFolders,
@@ -15,6 +14,7 @@ const {
   downloadFile,
   deleteFile,
   getFileStats,
+  getSharedFiles,
 } = require("../controllers/fileController");
 
 // =====================================================
@@ -32,6 +32,8 @@ router.get("/folders", authMiddleware, listFolders);
 router.get("/search", authMiddleware, searchFiles);
 
 router.get("/stats", authMiddleware, getFileStats);
+
+router.get("/shared", authMiddleware, getSharedFiles);
 
 // =====================================================
 // FILES
