@@ -46,6 +46,31 @@ const userSchema = new mongoose.Schema(
       default: null,
       select: false,
     },
+
+    about: {
+      type: String,
+      default: "Hey there! I am using SyncSpace.",
+    },
+
+    backupSettings: {
+      autoBackup: {
+        type: String,
+        enum: ["never", "daily", "weekly", "monthly"],
+        default: "never",
+      },
+      includePhotos: {
+        type: Boolean,
+        default: true,
+      },
+      includeVideos: {
+        type: Boolean,
+        default: false,
+      },
+      includeDocs: {
+        type: Boolean,
+        default: true,
+      },
+    },
   },
   {
     timestamps: true,

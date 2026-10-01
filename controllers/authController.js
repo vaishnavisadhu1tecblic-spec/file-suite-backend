@@ -1,3 +1,5 @@
+const fs = require("fs");
+const path = require("path");
 const { OAuth2Client } = require("google-auth-library");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
@@ -502,6 +504,121 @@ const deleteUser = async (req, res) => {
   }
 };
 
+// ================= Profile Photo Handlers =================
+
+const uploadProfilePhoto = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        message: "No image file uploaded",
+      });
+    }
+
+    const user = await User.findById(req.user.id);
+
+    if (!user) {
+      return res.status(404).json({
+        message: "User not found",
+      });
+    }
+
+    // Remove old local image file if present
+    if (user.image && !user.image.startsWith("http")) {
+      const oldPath = path.join(__dirname, "..", "uploads", user.image);
+      if (fs.existsSync(oldPath)) {
+        try {
+          fs.unlinkSync(oldPath);
+        } catch (unlinkErr) {
+          console.error("Error removing previous avatar:", unlinkErr);
+        }
+      }
+    }
+
+    user.image = req.file.filename;
+    await user.save();
+
+    return res.status(200).json({
+      success: true,
+      message: "Profile photo updated successfully",
+      user: sanitizeUser(user),
+    });
+  } catch (error) {
+    console.error("Upload profile photo error:", error);
+    return res.status(500).json({
+      message: error.message,
+    });
+  }
+};
+
+const removeProfilePhoto = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+
+    if (!user) {
+      return res.status(404).json({
+        message: "User not found",
+      });
+    }
+
+    if (user.image && !user.image.startsWith("http")) {
+      const oldPath = path.join(__dirname, "..", "uploads", user.image);
+      if (fs.existsSync(oldPath)) {
+        try {
+          fs.unlinkSync(oldPath);
+        } catch (unlinkErr) {
+          console.error("Error removing avatar:", unlinkErr);
+        }
+      }
+    }
+
+    user.image = "";
+    await user.save();
+
+    return res.status(200).json({
+      success: true,
+      message: "Profile photo removed successfully",
+      user: sanitizeUser(user),
+    });
+  } catch (error) {
+    console.error("Remove profile photo error:", error);
+    return res.status(500).json({
+      message: error.message,
+    });
+  }
+};
+
+const getProfilePhoto = async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const user = await User.findById(userId).select("image name");
+
+    if (!user || !user.image) {
+      return res.status(404).json({
+        message: "Profile photo not found",
+      });
+    }
+
+    if (user.image.startsWith("http")) {
+      return res.redirect(user.image);
+    }
+
+    const filePath = path.join(__dirname, "..", "uploads", user.image);
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({
+        message: "Profile photo file missing on server",
+      });
+    }
+
+    return res.sendFile(filePath);
+  } catch (error) {
+    console.error("Get profile photo error:", error);
+    return res.status(500).json({
+      message: error.message,
+    });
+  }
+};
+
 module.exports = {
   register,
   login,
@@ -513,4 +630,7 @@ module.exports = {
   forgotPassword,
   resetPassword,
   validateResetToken,
+  uploadProfilePhoto,
+  removeProfilePhoto,
+  getProfilePhoto,
 };

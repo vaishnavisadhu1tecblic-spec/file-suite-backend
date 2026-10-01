@@ -14,10 +14,15 @@ const fileRoutes = require("./routes/fileRoutes");
 const conversationRoutes = require("./routes/conversationRoutes");
 const friendRoutes = require("./routes/friendRoutes");
 const dashboardRoutes = require("./routes/dashboardRoutes");
+const statusRoutes = require("./routes/statusRoutes");
+const callRoutes = require("./routes/callRoutes");
+const backupRoutes = require("./routes/backupRoutes");
 
 const Message = require("./models/Message");
 const Conversation = require("./models/Conversation");
 const User = require("./models/User");
+const Call = require("./models/Call");
+const Status = require("./models/Status");
 
 const {
   getConversationForMember,
@@ -28,6 +33,7 @@ const {
 const { areFriends } = require("./utils/friendAccess");
 
 const onlineUsers = new Map();
+const activeCalls = new Map();
 
 const app = express();
 
@@ -45,13 +51,24 @@ const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:5174",
   "http://192.168.0.102:5173",
+  "http://192.168.0.102:5174",
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 
 app.use(
   cors({
-    origin: allowedOrigins,
-    methods: ["GET", "POST", "PUT", "DELETE"],
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (
+        allowedOrigins.includes(origin) ||
+        origin.endsWith(".trycloudflare.com") ||
+        /^http:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+)(:\d+)?$/.test(origin)
+      ) {
+        return callback(null, true);
+      }
+      return callback(null, true);
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     credentials: true,
   }),
 );
@@ -67,6 +84,9 @@ app.use("/api/friends", friendRoutes);
 app.use("/api/messages", messageRoutes);
 app.use("/api/files", fileRoutes);
 app.use("/api/conversations", conversationRoutes);
+app.use("/api/status", statusRoutes);
+app.use("/api/calls", callRoutes);
+app.use("/api/backup", backupRoutes);
 
 // =====================================================
 // HOME
@@ -88,7 +108,17 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (
+        allowedOrigins.includes(origin) ||
+        origin.endsWith(".trycloudflare.com") ||
+        /^http:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+)(:\d+)?$/.test(origin)
+      ) {
+        return callback(null, true);
+      }
+      return callback(null, true);
+    },
     methods: ["GET", "POST"],
     credentials: true,
   },
@@ -180,21 +210,38 @@ const isUserOnline = (userId) => {
 };
 
 // =====================================================
-// BROADCAST USER PRESENCE TO FRIENDS
+// BROADCAST USER PRESENCE TO FRIENDS & CHAT MEMBERS
 // =====================================================
 
 const broadcastUserPresence = async (userId, isOnline) => {
   try {
     const user = await User.findById(userId).select("friends");
+    const targetUserIds = new Set();
 
-    if (!user?.friends?.length) {
-      return;
+    if (user?.friends?.length) {
+      user.friends.forEach((friendId) => targetUserIds.add(String(friendId)));
     }
 
-    for (const friendId of user.friends) {
-      io.to(getUserRoom(friendId)).emit("user_status_changed", {
+    // Also include conversation participants
+    const conversations = await Conversation.find({
+      "members.userId": userId,
+    }).select("members");
+
+    conversations.forEach((conv) => {
+      conv.members?.forEach((m) => {
+        const mId = String(m.userId?._id || m.userId);
+        if (mId && mId !== String(userId)) {
+          targetUserIds.add(mId);
+        }
+      });
+    });
+
+    for (const targetId of targetUserIds) {
+      io.to(getUserRoom(targetId)).emit("user_status_changed", {
         userId: String(userId),
-        isOnline,
+        isOnline: Boolean(isOnline),
+        online: Boolean(isOnline),
+        status: isOnline ? "online" : "offline",
       });
     }
   } catch (error) {
@@ -292,14 +339,15 @@ io.on("connection", async (socket) => {
   // REQUEST PRESENCE
   // ===================================================
 
-  socket.on("request_presence", ({ userIds }, acknowledge) => {
+  socket.on("request_presence", (data = {}, acknowledge) => {
     try {
+      const { userIds = [] } = data || {};
+
       if (!Array.isArray(userIds)) {
         acknowledge?.({
           success: false,
           message: "userIds must be an array",
         });
-
         return;
       }
 
@@ -313,6 +361,8 @@ io.on("connection", async (socket) => {
         success: true,
         statuses,
       });
+
+      socket.emit("presence", { statuses });
     } catch (error) {
       console.error("Request presence error:", error);
 
@@ -649,8 +699,24 @@ io.on("connection", async (socket) => {
       const deliveredAt = receiverOnline ? new Date() : null;
 
       // -------------------------------------------------
-      // SAVE MESSAGE
+      // SAVE MESSAGE & UNHIDE CONVERSATION
       // -------------------------------------------------
+
+      await Conversation.updateOne(
+        { _id: conversation._id },
+        {
+          $pull: {
+            hiddenFor: {
+              $in: [
+                senderId,
+                receiverId,
+                new mongoose.Types.ObjectId(senderId),
+                new mongoose.Types.ObjectId(receiverId),
+              ],
+            },
+          },
+        },
+      );
 
       const savedMessage = await Message.create({
         chatId,
@@ -797,9 +863,32 @@ io.on("connection", async (socket) => {
         return;
       }
 
+      const currentUserObjectId = mongoose.Types.ObjectId.isValid(socket.userId)
+        ? new mongoose.Types.ObjectId(socket.userId)
+        : socket.userId;
+
+      const conversationObjectId = mongoose.Types.ObjectId.isValid(conversationId)
+        ? new mongoose.Types.ObjectId(conversationId)
+        : conversationId;
+
       const unreadMessages = await Message.find({
-        conversationId,
-        receiverId: socket.userId,
+        $and: [
+          {
+            $or: [
+              { conversationId: conversationObjectId },
+              { conversationId: String(conversationId) },
+              ...(conversation.legacyChatId
+                ? [{ chatId: String(conversation.legacyChatId) }]
+                : []),
+            ],
+          },
+          {
+            $or: [
+              { receiverId: currentUserObjectId },
+              { receiverId: socket.userId },
+            ],
+          },
+        ],
         status: {
           $ne: "read",
         },
@@ -821,9 +910,6 @@ io.on("connection", async (socket) => {
           _id: {
             $in: unreadMessages.map((message) => message._id),
           },
-
-          receiverId: socket.userId,
-
           status: {
             $ne: "read",
           },
@@ -994,6 +1080,28 @@ io.on("connection", async (socket) => {
         }
       }
 
+      // Check group send message permission
+      const senderMember = conversation.members?.find(
+        (m) => String(m.userId) === String(socket.userId),
+      );
+      const isSenderAdmin =
+        senderMember?.role === "admin" ||
+        senderMember?.role === "owner" ||
+        String(conversation.createdBy) === String(socket.userId);
+
+      if (
+        conversation.permissions?.sendMessages === "admins" &&
+        !isSenderAdmin
+      ) {
+        console.log(
+          "Rejected group message: Only admins can send messages in this group",
+        );
+        socket.emit("error_message", {
+          message: "Only group admins can send messages in this group",
+        });
+        return;
+      }
+
       const time =
         message.time ||
         new Date().toLocaleTimeString([], {
@@ -1066,6 +1174,271 @@ io.on("connection", async (socket) => {
       console.error("GROUP MESSAGE SAVE ERROR:", error);
     }
   });
+
+  // ===================================================
+  // WEBRTC CALL SIGNALING
+  // ===================================================
+
+  // 1. Initiate Call
+  socket.on("call:initiate", async (payload = {}, acknowledge) => {
+    try {
+      const {
+        targetUserId,
+        conversationId,
+        type = "voice",
+        isGroup = false,
+        callerInfo,
+      } = payload;
+      const callerId = String(socket.userId);
+
+      if (!targetUserId && !conversationId) {
+        acknowledge?.({
+          success: false,
+          message: "Target user or group required",
+        });
+        return;
+      }
+
+      const callerUser = await User.findById(callerId).select(
+        "name username email image",
+      );
+      const callerData = callerInfo || {
+        _id: callerId,
+        name: callerUser?.name || callerUser?.username || "User",
+        username: callerUser?.username,
+        image: callerUser?.image,
+      };
+
+      const callRecord = await Call.create({
+        callerId,
+        receiverId: targetUserId || null,
+        conversationId: conversationId || null,
+        type,
+        isGroup,
+        status: "ongoing",
+        startedAt: new Date(),
+        participants: [{ userId: callerId, joinedAt: new Date() }],
+      });
+
+      const callId = String(callRecord._id);
+      activeCalls.set(callId, {
+        callId,
+        callerId,
+        targetUserId: targetUserId ? String(targetUserId) : null,
+        conversationId: conversationId ? String(conversationId) : null,
+        type,
+        isGroup,
+        startTime: Date.now(),
+      });
+
+      if (isGroup && conversationId) {
+        io.to(`conversation_${conversationId}`).emit("call:group-incoming", {
+          callId,
+          conversationId,
+          caller: callerData,
+          type,
+        });
+      } else if (targetUserId) {
+        const targetRoom = getUserRoom(targetUserId);
+        io.to(targetRoom).emit("call:incoming", {
+          callId,
+          callerId,
+          caller: callerData,
+          type,
+          conversationId,
+        });
+      }
+
+      acknowledge?.({ success: true, callId, caller: callerData });
+    } catch (error) {
+      console.error("Call initiate error:", error);
+      acknowledge?.({ success: false, message: "Failed to initiate call" });
+    }
+  });
+
+  // 2. Accept Call
+  socket.on("call:accept", async ({ callId, callerId }, acknowledge) => {
+    try {
+      const call = activeCalls.get(String(callId));
+      if (call) {
+        call.accepted = true;
+        call.acceptedAt = Date.now();
+      }
+
+      if (callId) {
+        await Call.updateOne(
+          { _id: callId },
+          {
+            $addToSet: {
+              participants: { userId: socket.userId, joinedAt: new Date() },
+            },
+          },
+        );
+      }
+
+      if (callerId) {
+        io.to(getUserRoom(callerId)).emit("call:accepted", {
+          callId,
+          responderId: String(socket.userId),
+        });
+      }
+
+      acknowledge?.({ success: true });
+    } catch (error) {
+      console.error("Call accept error:", error);
+      acknowledge?.({ success: false, message: "Failed to accept call" });
+    }
+  });
+
+  // 3. Reject Call
+  socket.on(
+    "call:reject",
+    async ({ callId, callerId, reason = "rejected" }, acknowledge) => {
+      try {
+        if (callId) {
+          const status = reason === "busy" ? "busy" : "rejected";
+          await Call.updateOne(
+            { _id: callId },
+            { status, endedAt: new Date(), duration: 0 },
+          );
+          activeCalls.delete(String(callId));
+        }
+
+        if (callerId) {
+          io.to(getUserRoom(callerId)).emit("call:rejected", {
+            callId,
+            responderId: String(socket.userId),
+            reason,
+          });
+        }
+
+        acknowledge?.({ success: true });
+      } catch (error) {
+        console.error("Call reject error:", error);
+      }
+    },
+  );
+
+  // 4. End Call
+  socket.on("call:end", async ({ callId, targetUserId, duration = 0 }) => {
+    try {
+      if (callId) {
+        const call = activeCalls.get(String(callId));
+        const finalDuration =
+          duration ||
+          (call?.acceptedAt
+            ? Math.round((Date.now() - call.acceptedAt) / 1000)
+            : 0);
+        const finalStatus = finalDuration > 0 ? "completed" : "missed";
+
+        await Call.updateOne(
+          { _id: callId },
+          {
+            status: finalStatus,
+            duration: finalDuration,
+            endedAt: new Date(),
+          },
+        );
+        activeCalls.delete(String(callId));
+      }
+
+      if (targetUserId) {
+        io.to(getUserRoom(targetUserId)).emit("call:ended", {
+          callId,
+          fromUserId: String(socket.userId),
+          duration,
+        });
+      }
+    } catch (error) {
+      console.error("Call end error:", error);
+    }
+  });
+
+  // 5. WebRTC Offer (SDP)
+  socket.on("call:offer", ({ targetUserId, offer, callId }) => {
+    if (targetUserId && offer) {
+      io.to(getUserRoom(targetUserId)).emit("call:offer", {
+        offer,
+        callId,
+        fromUserId: String(socket.userId),
+      });
+    }
+  });
+
+  // 6. WebRTC Answer (SDP)
+  socket.on("call:answer", ({ targetUserId, answer, callId }) => {
+    if (targetUserId && answer) {
+      io.to(getUserRoom(targetUserId)).emit("call:answer", {
+        answer,
+        callId,
+        fromUserId: String(socket.userId),
+      });
+    }
+  });
+
+  // 7. WebRTC ICE Candidate
+  socket.on("call:ice-candidate", ({ targetUserId, candidate, callId }) => {
+    if (targetUserId && candidate) {
+      io.to(getUserRoom(targetUserId)).emit("call:ice-candidate", {
+        candidate,
+        callId,
+        fromUserId: String(socket.userId),
+      });
+    }
+  });
+
+  // 8. Toggle Audio/Video State Sync
+  socket.on(
+    "call:toggle-media",
+    ({ targetUserId, mediaType, enabled, callId }) => {
+      if (targetUserId) {
+        io.to(getUserRoom(targetUserId)).emit("call:peer-media-toggled", {
+          mediaType,
+          enabled,
+          callId,
+          fromUserId: String(socket.userId),
+        });
+      }
+    },
+  );
+
+  // 9. Group Calling Rooms
+  socket.on("call:group-join", async ({ groupId, callId, user }) => {
+    try {
+      const room = `call_group_${groupId}`;
+      socket.join(room);
+      socket.to(room).emit("call:group-peer-joined", {
+        userId: String(socket.userId),
+        user,
+        callId,
+      });
+    } catch (err) {
+      console.error("Group call join error:", err);
+    }
+  });
+
+  socket.on("call:group-leave", ({ groupId, callId }) => {
+    const room = `call_group_${groupId}`;
+    socket.leave(room);
+    socket.to(room).emit("call:group-peer-left", {
+      userId: String(socket.userId),
+      callId,
+    });
+  });
+
+  socket.on(
+    "call:group-signal",
+    ({ targetUserId, signal, groupId, callId }) => {
+      if (targetUserId) {
+        io.to(getUserRoom(targetUserId)).emit("call:group-signal", {
+          fromUserId: String(socket.userId),
+          signal,
+          groupId,
+          callId,
+        });
+      }
+    },
+  );
 
   // ===================================================
   // DISCONNECT

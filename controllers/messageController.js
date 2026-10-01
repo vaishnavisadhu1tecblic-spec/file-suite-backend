@@ -343,17 +343,41 @@ const getUnreadCounts = async (req, res) => {
 
     const currentUserObjectId = new mongoose.Types.ObjectId(currentUserId);
 
+    const userConversations = await Conversation.find({
+      "members.userId": currentUserId,
+      hiddenFor: {
+        $nin: [currentUserObjectId, currentUserId],
+      },
+    })
+      .select("_id")
+      .lean();
+
+    const conversationObjectIds = userConversations.map(
+      (conversation) => conversation._id,
+    );
+
     const unreadMessages = await Message.aggregate([
       {
         $match: {
-          receiverId: currentUserObjectId,
+          conversationId: {
+            $in: conversationObjectIds,
+          },
+
+          $or: [
+            {
+              receiverId: currentUserObjectId,
+            },
+            {
+              receiverId: currentUserId,
+            },
+          ],
 
           status: {
             $ne: "read",
           },
 
           hiddenFor: {
-            $ne: currentUserObjectId,
+            $nin: [currentUserObjectId, currentUserId],
           },
         },
       },
@@ -392,6 +416,106 @@ const getUnreadCounts = async (req, res) => {
     return res.status(500).json({
       success: false,
 
+      message: error.message,
+    });
+  }
+};
+
+// =====================================================
+// MARK CONVERSATION AS READ
+// =====================================================
+
+const markConversationRead = async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+    const currentUserId = String(req.user.id);
+
+    if (!conversationId) {
+      return res.status(400).json({
+        success: false,
+        message: "conversationId is required",
+      });
+    }
+
+    const conversation = await getConversationForMember(
+      conversationId,
+      currentUserId,
+    );
+
+    if (!conversation) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not a conversation member",
+      });
+    }
+
+    const currentUserObjectId = mongoose.Types.ObjectId.isValid(currentUserId)
+      ? new mongoose.Types.ObjectId(currentUserId)
+      : currentUserId;
+
+    const conversationObjectId = mongoose.Types.ObjectId.isValid(conversationId)
+      ? new mongoose.Types.ObjectId(conversationId)
+      : conversationId;
+
+    const readAt = new Date();
+
+    const result = await Message.updateMany(
+      {
+        $and: [
+          {
+            $or: [
+              { conversationId: conversationObjectId },
+              { conversationId: String(conversationId) },
+              ...(conversation.legacyChatId
+                ? [{ chatId: String(conversation.legacyChatId) }]
+                : []),
+            ],
+          },
+          {
+            $or: [
+              { receiverId: currentUserObjectId },
+              { receiverId: currentUserId },
+            ],
+          },
+        ],
+        status: {
+          $ne: "read",
+        },
+      },
+      {
+        $set: {
+          status: "read",
+          readAt,
+        },
+      },
+    );
+
+    const io = req.app.get("io");
+    if (io) {
+      const otherMembers =
+        conversation.members?.filter(
+          (m) => String(m.userId?._id || m.userId) !== currentUserId,
+        ) || [];
+
+      for (const member of otherMembers) {
+        const memberId = String(member.userId?._id || member.userId);
+        io.to(`user_${memberId}`).emit("messages_read", {
+          conversationId: String(conversationId),
+          readBy: currentUserId,
+          readAt,
+        });
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      updatedCount: result.modifiedCount || 0,
+    });
+  } catch (error) {
+    console.error("Mark conversation read error:", error);
+
+    return res.status(500).json({
+      success: false,
       message: error.message,
     });
   }
@@ -832,6 +956,8 @@ module.exports = {
   getMessageCount,
 
   getUnreadCounts,
+
+  markConversationRead,
 
   deleteMessage,
 

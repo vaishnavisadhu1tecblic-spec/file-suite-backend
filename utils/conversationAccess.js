@@ -68,6 +68,15 @@ const getOrCreatePrivateConversation = async (userId, otherUserId) => {
     }
   }
 
+  if (conversation) {
+    if (conversation.hiddenFor && conversation.hiddenFor.length > 0) {
+      await Conversation.updateOne(
+        { _id: conversation._id },
+        { $pull: { hiddenFor: userId } },
+      );
+    }
+  }
+
   return conversation;
 };
 

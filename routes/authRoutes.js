@@ -12,6 +12,9 @@ const {
   forgotPassword,
   resetPassword,
   validateResetToken,
+  uploadProfilePhoto,
+  removeProfilePhoto,
+  getProfilePhoto,
 } = require("../controllers/authController");
 
 const upload = require("../middleware/uploadMiddleware");
@@ -28,6 +31,16 @@ router.post("/google", googleLogin);
 router.post("/forgot-password", forgotPassword);
 router.get("/reset-password/:token", validateResetToken);
 router.post("/reset-password", resetPassword);
+
+// Profile Photo
+router.post(
+  "/profile-photo",
+  authMiddleware,
+  upload.single("image"),
+  uploadProfilePhoto,
+);
+router.delete("/profile-photo", authMiddleware, removeProfilePhoto);
+router.get("/profile-photo/:userId", getProfilePhoto);
 
 // Get All Users
 router.get("/users", authMiddleware, getUsers);
