@@ -6,17 +6,29 @@ const authMiddleware = require("../middleware/authMiddleware");
 
 const {
   getMessages,
+  sendMessage,
   getMessageCount,
   getUnreadCounts,
   markConversationRead,
+  markMessagesDelivered,
   deleteMessage,
   bulkDeleteMessages,
   clearConversation,
 } = require("../controllers/messageController");
 
 // =====================================================
-// MESSAGE COUNTS & READ STATUS
+// SEND MESSAGE
 // =====================================================
+
+router.post("/", authMiddleware, sendMessage);
+router.post("/send", authMiddleware, sendMessage);
+
+// =====================================================
+// MESSAGE DELIVERY & READ STATUS
+// =====================================================
+
+router.post("/delivered", authMiddleware, markMessagesDelivered);
+router.post("/:messageId/delivered", authMiddleware, markMessagesDelivered);
 
 router.get("/count", authMiddleware, getMessageCount);
 

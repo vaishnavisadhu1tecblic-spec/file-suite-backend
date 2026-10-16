@@ -1,9 +1,11 @@
 const mongoose = require("mongoose");
 const Message = require("../models/Message");
 const Conversation = require("../models/Conversation");
+const User = require("../models/User");
 
 const {
   getConversationForMember,
+  getOrCreatePrivateConversation,
   isValidConversationId,
 } = require("../utils/conversationAccess");
 
@@ -13,7 +15,7 @@ const { areFriends } = require("../utils/friendAccess");
 // MESSAGE PAGINATION
 // =====================================================
 
-const DEFAULT_MESSAGE_LIMIT = 20;
+const DEFAULT_MESSAGE_LIMIT = 10;
 const MAX_MESSAGE_LIMIT = 50;
 
 // =====================================================
@@ -33,33 +35,47 @@ const getPaginatedMessages = async ({ filter, limit, before, beforeId }) => {
     ...filter,
   };
 
+  const cursorFilter = [];
+
   if (before) {
     const beforeDate = new Date(before);
 
     if (!Number.isNaN(beforeDate.getTime())) {
       if (beforeId && mongoose.Types.ObjectId.isValid(beforeId)) {
-        queryFilter.$or = [
-          {
-            createdAt: {
-              $lt: beforeDate,
+        const beforeObjectId = new mongoose.Types.ObjectId(beforeId);
+
+        // Keyset cursor: same-millisecond messages are ordered by _id.
+        // Use $and so this does not overwrite conversation $or filters.
+        cursorFilter.push({
+          $or: [
+            {
+              createdAt: {
+                $lt: beforeDate,
+              },
             },
-          },
-          {
-            createdAt: beforeDate,
-            _id: {
-              $lt: beforeId,
+            {
+              createdAt: beforeDate,
+              _id: {
+                $lt: beforeObjectId,
+              },
             },
-          },
-        ];
+          ],
+        });
       } else {
-        queryFilter.createdAt = {
-          $lt: beforeDate,
-        };
+        cursorFilter.push({
+          createdAt: {
+            $lt: beforeDate,
+          },
+        });
       }
     }
   }
 
-  const messages = await Message.find(queryFilter)
+  const finalFilter = cursorFilter.length
+    ? { $and: [queryFilter, ...cursorFilter] }
+    : queryFilter;
+
+  const messages = await Message.find(finalFilter)
     .sort({
       createdAt: -1,
       _id: -1,
@@ -102,9 +118,14 @@ const getMessages = async (req, res) => {
         ? Math.min(requestedLimit, MAX_MESSAGE_LIMIT)
         : DEFAULT_MESSAGE_LIMIT;
 
-    const before = req.query.before || null;
+    let before = req.query.before || null;
 
-    const beforeId = req.query.beforeId || null;
+    let beforeId = req.query.beforeId || null;
+
+    if (before && typeof before === "object") {
+      beforeId = beforeId || before.id || before._id || null;
+      before = before.createdAt || before.before || null;
+    }
 
     // =================================================
     // CURRENT CONVERSATION
@@ -123,11 +144,21 @@ const getMessages = async (req, res) => {
         });
       }
 
+      const currentUserObjectId = mongoose.Types.ObjectId.isValid(currentUserId)
+        ? new mongoose.Types.ObjectId(currentUserId)
+        : currentUserId;
+
       const result = await getPaginatedMessages({
         filter: {
-          conversationId: chatId,
+          $or: [
+            { conversationId: conversation._id },
+            { conversationId: String(conversation._id) },
+            ...(conversation.legacyChatId
+              ? [{ chatId: String(conversation.legacyChatId) }]
+              : []),
+          ],
           hiddenFor: {
-            $ne: currentUserId,
+            $nin: [currentUserId, currentUserObjectId],
           },
         },
 
@@ -175,10 +206,14 @@ const getMessages = async (req, res) => {
         });
       }
 
+      const currentUserObjectId = mongoose.Types.ObjectId.isValid(currentUserId)
+        ? new mongoose.Types.ObjectId(currentUserId)
+        : currentUserId;
+
       const result = await getPaginatedMessages({
         filter: {
           hiddenFor: {
-            $ne: currentUserId,
+            $nin: [currentUserId, currentUserObjectId],
           },
 
           $or: [
@@ -217,16 +252,28 @@ const getMessages = async (req, res) => {
     }
 
     // =================================================
-    // LEGACY PRIVATE CHAT
+    // PRIVATE CHAT (BY CHAT KEY user1_user2)
     // =================================================
 
-    const privateConversation = await Conversation.findOne({
+    const parts = String(chatId).split("_");
+    const otherUserId =
+      parts.find((id) => id !== currentUserId) || parts[0];
+    const privateKey = parts.slice(0, 2).sort().join(":");
+
+    let privateConversation = await Conversation.findOne({
       type: "private",
-
-      privateKey: String(chatId).split("_").sort().join(":"),
-
+      privateKey,
       "members.userId": currentUserId,
     });
+
+    if (!privateConversation && otherUserId) {
+      if (await areFriends(currentUserId, otherUserId)) {
+        privateConversation = await getOrCreatePrivateConversation(
+          currentUserId,
+          otherUserId,
+        );
+      }
+    }
 
     const otherMember = privateConversation?.members?.find(
       (member) => String(member.userId) !== currentUserId,
@@ -243,12 +290,19 @@ const getMessages = async (req, res) => {
       });
     }
 
+    const currentUserObjectId = mongoose.Types.ObjectId.isValid(currentUserId)
+      ? new mongoose.Types.ObjectId(currentUserId)
+      : currentUserId;
+
     const result = await getPaginatedMessages({
       filter: {
-        conversationId: privateConversation._id,
-
+        $or: [
+          { conversationId: privateConversation._id },
+          { chatId: String(chatId) },
+          { chatId: [currentUserId, otherUserId].sort().join("_") },
+        ],
         hiddenFor: {
-          $ne: currentUserId,
+          $nin: [currentUserId, currentUserObjectId],
         },
       },
 
@@ -459,25 +513,34 @@ const markConversationRead = async (req, res) => {
 
     const readAt = new Date();
 
+    const unreadMessages = await Message.find({
+      $and: [
+        {
+          $or: [
+            { conversationId: conversationObjectId },
+            { conversationId: String(conversationId) },
+            ...(conversation.legacyChatId
+              ? [{ chatId: String(conversation.legacyChatId) }]
+              : []),
+          ],
+        },
+        {
+          $or: [
+            { receiverId: currentUserObjectId },
+            { receiverId: currentUserId },
+          ],
+        },
+      ],
+      status: {
+        $ne: "read",
+      },
+    }).select("_id senderId chatId conversationId localId");
+
     const result = await Message.updateMany(
       {
-        $and: [
-          {
-            $or: [
-              { conversationId: conversationObjectId },
-              { conversationId: String(conversationId) },
-              ...(conversation.legacyChatId
-                ? [{ chatId: String(conversation.legacyChatId) }]
-                : []),
-            ],
-          },
-          {
-            $or: [
-              { receiverId: currentUserObjectId },
-              { receiverId: currentUserId },
-            ],
-          },
-        ],
+        _id: {
+          $in: unreadMessages.map((message) => message._id),
+        },
         status: {
           $ne: "read",
         },
@@ -492,6 +555,23 @@ const markConversationRead = async (req, res) => {
 
     const io = req.app.get("io");
     if (io) {
+      for (const msg of unreadMessages) {
+        const updatePayload = {
+          messageId: String(msg._id),
+          localId: msg.localId || null,
+          status: "read",
+          readAt,
+          chatId: msg.chatId ? String(msg.chatId) : null,
+          conversationId: msg.conversationId
+            ? String(msg.conversationId)
+            : null,
+        };
+        io.to(`user_${msg.senderId}`).emit("message_status_updated", updatePayload);
+        if (msg.conversationId) {
+          io.to(`conversation_${msg.conversationId}`).emit("message_status_updated", updatePayload);
+        }
+      }
+
       const otherMembers =
         conversation.members?.filter(
           (m) => String(m.userId?._id || m.userId) !== currentUserId,
@@ -505,6 +585,11 @@ const markConversationRead = async (req, res) => {
           readAt,
         });
       }
+      io.to(`conversation_${conversation._id}`).emit("messages_read", {
+        conversationId: String(conversationId),
+        readBy: currentUserId,
+        readAt,
+      });
     }
 
     return res.status(200).json({
@@ -514,6 +599,98 @@ const markConversationRead = async (req, res) => {
   } catch (error) {
     console.error("Mark conversation read error:", error);
 
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+// =====================================================
+// MARK MESSAGES DELIVERED (REST API)
+// =====================================================
+
+const markMessagesDelivered = async (req, res) => {
+  try {
+    const currentUserId = String(req.user.id);
+    const { messageIds, messageId } = req.body || {};
+    const ids = Array.isArray(messageIds)
+      ? messageIds
+      : messageId
+        ? [messageId]
+        : req.params?.messageId
+          ? [req.params.messageId]
+          : [];
+
+    if (!ids.length) {
+      return res.status(200).json({ success: true, updatedCount: 0 });
+    }
+
+    const validObjectIds = ids
+      .filter((id) => mongoose.Types.ObjectId.isValid(id))
+      .map((id) => new mongoose.Types.ObjectId(id));
+
+    if (!validObjectIds.length) {
+      return res.status(200).json({ success: true, updatedCount: 0 });
+    }
+
+    const currentUserObjectId = mongoose.Types.ObjectId.isValid(currentUserId)
+      ? new mongoose.Types.ObjectId(currentUserId)
+      : currentUserId;
+
+    const unconfirmedMessages = await Message.find({
+      _id: { $in: validObjectIds },
+      $or: [
+        { receiverId: currentUserObjectId },
+        { receiverId: currentUserId },
+      ],
+      status: "sent",
+    }).select("_id senderId chatId conversationId localId");
+
+    if (!unconfirmedMessages.length) {
+      return res.status(200).json({ success: true, updatedCount: 0 });
+    }
+
+    const deliveredAt = new Date();
+    await Message.updateMany(
+      {
+        _id: { $in: unconfirmedMessages.map((m) => m._id) },
+        status: "sent",
+      },
+      {
+        $set: {
+          status: "delivered",
+          deliveredAt,
+        },
+      },
+    );
+
+    const io = req.app.get("io");
+    if (io) {
+      for (const msg of unconfirmedMessages) {
+        const updatePayload = {
+          messageId: String(msg._id),
+          localId: msg.localId || null,
+          status: "delivered",
+          deliveredAt,
+          chatId: msg.chatId ? String(msg.chatId) : null,
+          conversationId: msg.conversationId
+            ? String(msg.conversationId)
+            : null,
+        };
+        io.to(`user_${msg.senderId}`).emit("message_status_updated", updatePayload);
+        if (msg.conversationId) {
+          io.to(`conversation_${msg.conversationId}`).emit("message_status_updated", updatePayload);
+        }
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      updatedCount: unconfirmedMessages.length,
+    });
+  } catch (error) {
+    console.error("Mark messages delivered error:", error);
     return res.status(500).json({
       success: false,
       message: error.message,
@@ -945,11 +1122,195 @@ const clearConversation = async (req, res) => {
 };
 
 // =====================================================
+// SEND MESSAGE (REST API FALLBACK / PERSISTENCE)
+// =====================================================
+
+const sendMessage = async (req, res) => {
+  try {
+    const currentUserId = String(req.user.id);
+    const {
+      receiverId,
+      conversationId,
+      chatId,
+      text,
+      time,
+      localId,
+      clientTempId,
+    } = req.body;
+
+    if (!text || !text.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Message text is required",
+      });
+    }
+
+    const messageTime =
+      time ||
+      new Date().toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+
+    let targetConversation = null;
+    let finalChatId = chatId;
+    let finalReceiverId = receiverId ? String(receiverId) : null;
+
+    if (conversationId && isValidConversationId(conversationId)) {
+      targetConversation = await getConversationForMember(
+        conversationId,
+        currentUserId,
+      );
+
+      if (!targetConversation) {
+        return res.status(403).json({
+          success: false,
+          message: "You are not a conversation member",
+        });
+      }
+
+      if (targetConversation.type === "group") {
+        const senderMember = targetConversation.members?.find(
+          (m) => String(m.userId) === currentUserId,
+        );
+        const isSenderAdmin =
+          senderMember?.role === "admin" ||
+          senderMember?.role === "owner" ||
+          String(targetConversation.createdBy) === currentUserId;
+
+        if (
+          targetConversation.permissions?.sendMessages === "admins" &&
+          !isSenderAdmin
+        ) {
+          return res.status(403).json({
+            success: false,
+            message: "Only group admins can send messages in this group",
+          });
+        }
+        finalChatId = String(conversationId);
+        finalReceiverId = null;
+      } else {
+        const otherMember = targetConversation.members?.find(
+          (m) => String(m.userId) !== currentUserId,
+        );
+        finalReceiverId = otherMember
+          ? String(otherMember.userId)
+          : receiverId;
+        finalChatId = [currentUserId, finalReceiverId].sort().join("_");
+      }
+    } else if (finalReceiverId) {
+      const receiver = await User.findById(finalReceiverId).select("_id");
+      if (!receiver) {
+        return res.status(404).json({
+          success: false,
+          message: "Receiver not found",
+        });
+      }
+
+      if (!(await areFriends(currentUserId, finalReceiverId))) {
+        return res.status(403).json({
+          success: false,
+          message: "Users are not accepted friends",
+        });
+      }
+
+      targetConversation = await getOrCreatePrivateConversation(
+        currentUserId,
+        finalReceiverId,
+      );
+      finalChatId = [currentUserId, finalReceiverId].sort().join("_");
+    } else {
+      return res.status(400).json({
+        success: false,
+        message: "receiverId or conversationId required",
+      });
+    }
+
+    // Unhide conversation
+    await Conversation.updateOne(
+      { _id: targetConversation._id },
+      {
+        $pull: {
+          hiddenFor: {
+            $in: [
+              currentUserId,
+              new mongoose.Types.ObjectId(currentUserId),
+              ...(finalReceiverId
+                ? [
+                    finalReceiverId,
+                    new mongoose.Types.ObjectId(finalReceiverId),
+                  ]
+                : []),
+            ],
+          },
+        },
+      },
+    );
+
+    const savedMessage = await Message.create({
+      chatId: finalChatId,
+      conversationId: targetConversation._id,
+      senderId: currentUserId,
+      receiverId: finalReceiverId,
+      text: text.trim(),
+      time: messageTime,
+      status: "sent",
+      deliveredAt: null,
+      localId: localId || clientTempId || null,
+    });
+
+    const responsePayload = {
+      _id: String(savedMessage._id),
+      chatId: String(savedMessage.chatId),
+      conversationId: String(savedMessage.conversationId),
+      senderId: String(savedMessage.senderId),
+      receiverId: savedMessage.receiverId
+        ? String(savedMessage.receiverId)
+        : null,
+      text: savedMessage.text,
+      time: savedMessage.time,
+      createdAt: savedMessage.createdAt,
+      status: savedMessage.status,
+      localId: localId || clientTempId || null,
+    };
+
+    const io = req.app.get("io");
+    if (io) {
+      if (targetConversation.type === "group") {
+        io.to(`group_${finalChatId}`).emit("receive_message", {
+          ...responsePayload,
+          type: "group",
+        });
+      } else if (finalReceiverId) {
+        io.to(`user_${finalReceiverId}`).emit("receive_private_message", {
+          ...responsePayload,
+          type: "received",
+        });
+      }
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: responsePayload,
+      localId: localId || clientTempId || null,
+    });
+  } catch (error) {
+    console.error("REST sendMessage error:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+// =====================================================
 // EXPORTS
 // =====================================================
 
 module.exports = {
   getMessages,
+
+  sendMessage,
 
   getPrivateChatId,
 
@@ -959,9 +1320,12 @@ module.exports = {
 
   markConversationRead,
 
+  markMessagesDelivered,
+
   deleteMessage,
 
   bulkDeleteMessages,
 
   clearConversation,
 };
+

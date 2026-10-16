@@ -100,6 +100,12 @@ const messageSchema = new mongoose.Schema(
       default: null,
     },
 
+    localId: {
+      type: String,
+      default: null,
+      index: true,
+    },
+
     // =====================================================
     // DELETE FOR ME
     // =====================================================
@@ -117,5 +123,9 @@ const messageSchema = new mongoose.Schema(
     timestamps: true,
   },
 );
+
+messageSchema.index({ conversationId: 1, createdAt: -1, _id: -1 });
+messageSchema.index({ chatId: 1, createdAt: -1, _id: -1 });
+messageSchema.index({ receiverId: 1, status: 1, createdAt: 1 });
 
 module.exports = mongoose.model("Message", messageSchema);

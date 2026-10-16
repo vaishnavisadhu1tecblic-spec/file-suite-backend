@@ -2,6 +2,7 @@ const express = require("express");
 const http = require("http");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
+const mongoose = require("mongoose");
 const { Server } = require("socket.io");
 
 require("dotenv").config();
@@ -27,6 +28,7 @@ const Status = require("./models/Status");
 const {
   getConversationForMember,
   getOrCreateLegacyConversation,
+  getOrCreatePrivateConversation,
   isValidConversationId,
 } = require("./utils/conversationAccess");
 
@@ -289,47 +291,38 @@ io.on("connection", async (socket) => {
   }
 
   // ===================================================
-  // DELIVER PENDING MESSAGES
+  // DELIVER PENDING MESSAGES ON RECONNECT
   // ===================================================
 
   try {
     const pendingMessages = await Message.find({
       receiverId: socket.userId,
       status: "sent",
-    }).select("_id senderId chatId conversationId");
+    })
+      .sort({ createdAt: 1 })
+      .lean();
 
     if (pendingMessages.length > 0) {
-      const deliveredAt = new Date();
-
-      await Message.updateMany(
-        {
-          _id: {
-            $in: pendingMessages.map((message) => message._id),
-          },
-        },
-        {
-          $set: {
-            status: "delivered",
-            deliveredAt,
-          },
-        },
+      console.log(
+        `Delivering ${pendingMessages.length} pending message(s) to user ${socket.userId}`,
       );
 
-      for (const message of pendingMessages) {
-        io.to(getUserRoom(message.senderId)).emit("message_status_updated", {
-          messageId: String(message._id),
-          status: "delivered",
-          deliveredAt,
-          chatId: message.chatId ? String(message.chatId) : null,
-          conversationId: message.conversationId
-            ? String(message.conversationId)
+      for (const msg of pendingMessages) {
+        socket.emit("receive_private_message", {
+          _id: String(msg._id),
+          chatId: String(msg.chatId),
+          conversationId: msg.conversationId
+            ? String(msg.conversationId)
             : null,
+          senderId: String(msg.senderId),
+          receiverId: String(msg.receiverId),
+          text: msg.text,
+          time: msg.time,
+          createdAt: msg.createdAt,
+          status: msg.status,
+          type: "received",
         });
       }
-
-      console.log(
-        `Delivered ${pendingMessages.length} pending message(s) to user ${socket.userId}`,
-      );
     }
   } catch (error) {
     console.error("Pending message delivery error:", error);
@@ -339,7 +332,7 @@ io.on("connection", async (socket) => {
   // REQUEST PRESENCE
   // ===================================================
 
-  socket.on("request_presence", (data = {}, acknowledge) => {
+  socket.on("request_presence", async (data = {}, acknowledge) => {
     try {
       const { userIds = [] } = data || {};
 
@@ -351,10 +344,40 @@ io.on("connection", async (socket) => {
         return;
       }
 
+      const allowedIds = new Set([String(socket.userId)]);
+
+      const currentUser = await User.findById(socket.userId)
+        .select("friends")
+        .lean();
+
+      (currentUser?.friends || []).forEach((friendId) => {
+        if (friendId) {
+          allowedIds.add(String(friendId));
+        }
+      });
+
+      const conversations = await Conversation.find({
+        "members.userId": socket.userId,
+      })
+        .select("members")
+        .lean();
+
+      conversations.forEach((conversation) => {
+        conversation.members?.forEach((member) => {
+          const memberId = String(member.userId?._id || member.userId || "");
+          if (memberId) {
+            allowedIds.add(memberId);
+          }
+        });
+      });
+
       const statuses = {};
 
       userIds.forEach((userId) => {
-        statuses[String(userId)] = isUserOnline(userId);
+        const id = String(userId);
+        if (allowedIds.has(id)) {
+          statuses[id] = isUserOnline(id);
+        }
       });
 
       acknowledge?.({
@@ -451,8 +474,15 @@ io.on("connection", async (socket) => {
   // JOIN GROUP CHAT
   // ===================================================
 
-  socket.on("join_chat", async (chatId, acknowledge) => {
+  socket.on("join_chat", async (payload, acknowledge) => {
     try {
+      const rawChatId =
+        typeof payload === "object" && payload !== null
+          ? payload.conversationId || payload.chatId || payload.id
+          : payload;
+
+      const chatId = rawChatId ? String(rawChatId) : "";
+
       if (!chatId) {
         console.log("Group chat ID missing");
 
@@ -623,43 +653,18 @@ io.on("connection", async (socket) => {
       }
 
       // -------------------------------------------------
-      // FIND PRIVATE CONVERSATION
+      // FIND OR CREATE PRIVATE CONVERSATION
       // -------------------------------------------------
 
-      const conversation = await Conversation.findOne({
-        type: "private",
-        privateKey: [senderId, receiverId].sort().join(":"),
-        members: {
-          $all: [
-            {
-              $elemMatch: {
-                userId: senderId,
-              },
-            },
-            {
-              $elemMatch: {
-                userId: receiverId,
-              },
-            },
-          ],
-        },
-      });
+      const conversation = await getOrCreatePrivateConversation(
+        senderId,
+        receiverId,
+      );
 
-      console.log("CHAT DEBUG private conversation lookup result:", {
-        found: Boolean(conversation),
-        conversationId: conversation ? String(conversation._id) : null,
-      });
-
-      if (
-        !conversation ||
-        conversation.type !== "private" ||
-        !conversation.members.some(
-          (member) => String(member.userId) === receiverId,
-        )
-      ) {
+      if (!conversation) {
         const rejection = {
           success: false,
-          reason: "Private conversation not found or membership invalid",
+          reason: "Private conversation could not be established",
           chatId,
         };
 
@@ -689,14 +694,11 @@ io.on("connection", async (socket) => {
         });
 
       // -------------------------------------------------
-      // DELIVERY STATUS
+      // DELIVERY STATUS: ALWAYS INITIAL "sent" (ONE GREY TICK)
       // -------------------------------------------------
 
-      const receiverOnline = isUserOnline(receiverId);
-
-      const initialStatus = receiverOnline ? "delivered" : "sent";
-
-      const deliveredAt = receiverOnline ? new Date() : null;
+      const initialStatus = "sent";
+      const deliveredAt = null;
 
       // -------------------------------------------------
       // SAVE MESSAGE & UNHIDE CONVERSATION
@@ -718,6 +720,8 @@ io.on("connection", async (socket) => {
         },
       );
 
+      const clientLocalId = message.localId || message._id || null;
+
       const savedMessage = await Message.create({
         chatId,
         conversationId: conversation._id,
@@ -725,10 +729,9 @@ io.on("connection", async (socket) => {
         receiverId,
         text: message.text.trim(),
         time,
-
         status: initialStatus,
-
         deliveredAt,
+        localId: clientLocalId,
       });
 
       console.log("CHAT DEBUG message save result:", {
@@ -736,6 +739,7 @@ io.on("connection", async (socket) => {
         messageId: String(savedMessage._id),
         conversationId: String(savedMessage.conversationId),
         status: savedMessage.status,
+        localId: clientLocalId,
       });
 
       acknowledge?.({
@@ -743,6 +747,19 @@ io.on("connection", async (socket) => {
         messageId: String(savedMessage._id),
         conversationId: String(savedMessage.conversationId),
         status: savedMessage.status,
+        localId: clientLocalId,
+        message: {
+          _id: String(savedMessage._id),
+          chatId: String(savedMessage.chatId),
+          conversationId: String(savedMessage.conversationId),
+          senderId: String(savedMessage.senderId),
+          receiverId: String(savedMessage.receiverId),
+          text: savedMessage.text,
+          time: savedMessage.time,
+          createdAt: savedMessage.createdAt,
+          status: savedMessage.status,
+          localId: clientLocalId,
+        },
       });
 
       console.log("=================================");
@@ -791,6 +808,7 @@ io.on("connection", async (socket) => {
       const senderMessage = {
         ...baseMessage,
         type: "sent",
+        localId: clientLocalId,
       };
 
       socket.emit("receive_private_message", senderMessage);
@@ -835,6 +853,187 @@ io.on("connection", async (socket) => {
   });
 
   // ===================================================
+  // MESSAGE DELIVERED ACKNOWLEDGMENT
+  // ===================================================
+
+  socket.on("message_delivered", async (payload, acknowledge) => {
+    try {
+      const messageId = payload?.messageId || payload?._id;
+      if (!messageId) {
+        acknowledge?.({ success: false, reason: "messageId missing" });
+        return;
+      }
+
+      const message = await Message.findById(messageId);
+      if (!message) {
+        acknowledge?.({ success: false, reason: "Message not found" });
+        return;
+      }
+
+      // Verify that socket.userId is authorized
+      const isDirectReceiver =
+        String(message.receiverId) === String(socket.userId);
+      let isMember = isDirectReceiver;
+
+      if (!isMember && message.conversationId) {
+        const conversation = await Conversation.findOne({
+          _id: message.conversationId,
+          "members.userId": socket.userId,
+        });
+        if (conversation) {
+          isMember = true;
+        }
+      }
+
+      if (!isMember) {
+        acknowledge?.({
+          success: false,
+          reason: "Unauthorized delivery acknowledgment",
+        });
+        return;
+      }
+
+      // If already read, do not revert to delivered
+      if (message.status === "read") {
+        acknowledge?.({ success: true, status: "read" });
+        return;
+      }
+
+      if (message.status === "delivered") {
+        acknowledge?.({ success: true, status: "delivered" });
+        return;
+      }
+
+      const deliveredAt = new Date();
+      message.status = "delivered";
+      message.deliveredAt = deliveredAt;
+      await message.save();
+
+      const updatePayload = {
+        messageId: String(message._id),
+        localId: message.localId || payload?.localId || null,
+        status: "delivered",
+        deliveredAt,
+        chatId: message.chatId ? String(message.chatId) : null,
+        conversationId: message.conversationId
+          ? String(message.conversationId)
+          : null,
+      };
+
+      // Notify the sender that the message was delivered (two grey ticks)
+      io.to(getUserRoom(message.senderId)).emit(
+        "message_status_updated",
+        updatePayload,
+      );
+
+      if (message.conversationId) {
+        io.to(`conversation_${message.conversationId}`).emit(
+          "message_status_updated",
+          updatePayload,
+        );
+      }
+
+      acknowledge?.({ success: true, status: "delivered" });
+    } catch (error) {
+      console.error("message_delivered error:", error);
+      acknowledge?.({ success: false, reason: error.message });
+    }
+  });
+
+  // ===================================================
+  // BATCH MESSAGES DELIVERED ACKNOWLEDGMENT
+  // ===================================================
+
+  socket.on("messages_delivered", async (payload, acknowledge) => {
+    try {
+      const messageIds = Array.isArray(payload)
+        ? payload
+        : Array.isArray(payload?.messageIds)
+          ? payload.messageIds
+          : payload?.messageId
+            ? [payload.messageId]
+            : [];
+
+      if (!messageIds.length) {
+        acknowledge?.({ success: true, updatedCount: 0 });
+        return;
+      }
+
+      const validObjectIds = messageIds
+        .filter((id) => mongoose.Types.ObjectId.isValid(id))
+        .map((id) => new mongoose.Types.ObjectId(id));
+
+      if (!validObjectIds.length) {
+        acknowledge?.({ success: true, updatedCount: 0 });
+        return;
+      }
+
+      const currentUserObjectId = mongoose.Types.ObjectId.isValid(socket.userId)
+        ? new mongoose.Types.ObjectId(socket.userId)
+        : socket.userId;
+
+      const unconfirmedMessages = await Message.find({
+        _id: { $in: validObjectIds },
+        $or: [
+          { receiverId: currentUserObjectId },
+          { receiverId: socket.userId },
+        ],
+        status: "sent",
+      }).select("_id senderId chatId conversationId localId");
+
+      if (!unconfirmedMessages.length) {
+        acknowledge?.({ success: true, updatedCount: 0 });
+        return;
+      }
+
+      const deliveredAt = new Date();
+      await Message.updateMany(
+        {
+          _id: { $in: unconfirmedMessages.map((m) => m._id) },
+          status: "sent",
+        },
+        {
+          $set: {
+            status: "delivered",
+            deliveredAt,
+          },
+        },
+      );
+
+      for (const msg of unconfirmedMessages) {
+        const updatePayload = {
+          messageId: String(msg._id),
+          localId: msg.localId || null,
+          status: "delivered",
+          deliveredAt,
+          chatId: msg.chatId ? String(msg.chatId) : null,
+          conversationId: msg.conversationId
+            ? String(msg.conversationId)
+            : null,
+        };
+        io.to(getUserRoom(msg.senderId)).emit(
+          "message_status_updated",
+          updatePayload,
+        );
+        if (msg.conversationId) {
+          io.to(`conversation_${msg.conversationId}`).emit(
+            "message_status_updated",
+            updatePayload,
+          );
+        }
+      }
+
+      acknowledge?.({
+        success: true,
+        updatedCount: unconfirmedMessages.length,
+      });
+    } catch (error) {
+      console.error("messages_delivered error:", error);
+      acknowledge?.({ success: false, reason: error.message });
+    }
+  });
+
+  // ===================================================
   // MARK PRIVATE MESSAGES AS READ
   // ===================================================
 
@@ -867,7 +1066,9 @@ io.on("connection", async (socket) => {
         ? new mongoose.Types.ObjectId(socket.userId)
         : socket.userId;
 
-      const conversationObjectId = mongoose.Types.ObjectId.isValid(conversationId)
+      const conversationObjectId = mongoose.Types.ObjectId.isValid(
+        conversationId,
+      )
         ? new mongoose.Types.ObjectId(conversationId)
         : conversationId;
 
@@ -892,7 +1093,7 @@ io.on("connection", async (socket) => {
         status: {
           $ne: "read",
         },
-      }).select("_id senderId chatId conversationId");
+      }).select("_id senderId chatId conversationId localId");
 
       if (unreadMessages.length === 0) {
         acknowledge?.({
@@ -923,20 +1124,44 @@ io.on("connection", async (socket) => {
       );
 
       for (const message of unreadMessages) {
-        io.to(getUserRoom(message.senderId)).emit("message_status_updated", {
+        const updatePayload = {
           messageId: String(message._id),
-
+          localId: message.localId || null,
           status: "read",
-
           readAt,
-
           chatId: message.chatId ? String(message.chatId) : null,
-
           conversationId: message.conversationId
             ? String(message.conversationId)
             : null,
+        };
+        io.to(getUserRoom(message.senderId)).emit(
+          "message_status_updated",
+          updatePayload,
+        );
+        if (message.conversationId) {
+          io.to(`conversation_${message.conversationId}`).emit(
+            "message_status_updated",
+            updatePayload,
+          );
+        }
+      }
+
+      // Also broadcast messages_read event for conversation
+      const uniqueSenders = [
+        ...new Set(unreadMessages.map((m) => String(m.senderId))),
+      ];
+      for (const sId of uniqueSenders) {
+        io.to(getUserRoom(sId)).emit("messages_read", {
+          conversationId: String(conversationId),
+          readBy: String(socket.userId),
+          readAt,
         });
       }
+      io.to(`conversation_${conversation._id}`).emit("messages_read", {
+        conversationId: String(conversationId),
+        readBy: String(socket.userId),
+        readAt,
+      });
 
       acknowledge?.({
         success: true,
@@ -1034,7 +1259,7 @@ io.on("connection", async (socket) => {
   // SEND GROUP MESSAGE
   // ===================================================
 
-  socket.on("send_message", async (message) => {
+  socket.on("send_message", async (message, acknowledge) => {
     try {
       console.log("=================================");
       console.log("GROUP MESSAGE RECEIVED");
@@ -1045,12 +1270,13 @@ io.on("connection", async (socket) => {
 
       if (!message?.chatId) {
         console.log("Chat ID missing");
+        acknowledge?.({ success: false, reason: "Chat ID missing" });
         return;
       }
 
       if (!message?.text?.trim()) {
         console.log("Message text missing");
-
+        acknowledge?.({ success: false, reason: "Message text missing" });
         return;
       }
 
@@ -1063,7 +1289,10 @@ io.on("connection", async (socket) => {
 
         if (!conversation) {
           console.log("Unauthorized group message:", chatId);
-
+          acknowledge?.({
+            success: false,
+            reason: "Unauthorized group message",
+          });
           return;
         }
       } else {
@@ -1075,7 +1304,10 @@ io.on("connection", async (socket) => {
 
         if (!conversation) {
           console.log("Unauthorized legacy group message:", chatId);
-
+          acknowledge?.({
+            success: false,
+            reason: "Unauthorized legacy group message",
+          });
           return;
         }
       }
@@ -1098,6 +1330,10 @@ io.on("connection", async (socket) => {
         );
         socket.emit("error_message", {
           message: "Only group admins can send messages in this group",
+        });
+        acknowledge?.({
+          success: false,
+          reason: "Only group admins can send messages in this group",
         });
         return;
       }
@@ -1131,6 +1367,8 @@ io.on("connection", async (socket) => {
 
       console.log("GROUP MESSAGE SAVED IN MONGODB:", savedMessage._id);
 
+      const clientLocalId = message.localId || message._id || null;
+
       // =================================================
       // MESSAGE OBJECT
       // =================================================
@@ -1157,6 +1395,8 @@ io.on("connection", async (socket) => {
         status: savedMessage.status,
 
         type: "group",
+
+        localId: clientLocalId,
       };
 
       // =================================================
@@ -1169,9 +1409,21 @@ io.on("connection", async (socket) => {
 
       io.to(roomName).emit("receive_message", messageToSend);
 
+      acknowledge?.({
+        success: true,
+        messageId: String(savedMessage._id),
+        conversationId: savedMessage.conversationId
+          ? String(savedMessage.conversationId)
+          : null,
+        status: savedMessage.status,
+        localId: clientLocalId,
+        message: messageToSend,
+      });
+
       console.log("GROUP MESSAGE EMITTED:", messageToSend);
     } catch (error) {
       console.error("GROUP MESSAGE SAVE ERROR:", error);
+      acknowledge?.({ success: false, reason: error.message });
     }
   });
 

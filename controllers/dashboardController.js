@@ -199,12 +199,21 @@ const getDashboard = async (req, res) => {
         new Date(b.lastMessageTime || 0) - new Date(a.lastMessageTime || 0),
     );
 
+    const storageQuotaBytes = 100 * 1024 * 1024 * 1024;
+    const storagePercent = Math.min(
+      100,
+      Math.round((totalBytes / storageQuotaBytes) * 100),
+    );
+
     return res.status(200).json({
       success: true,
       dashboard: {
         filesUploaded,
         messages,
         storageUsed: formatStorage(totalBytes),
+        storageQuota: "100 GB",
+        storageQuotaBytes,
+        storagePercent,
         totalBytes,
         sharedFiles,
         recentUploads,
